@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-2.0.0}"
 OUT_DIR="${2:-dist}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_DIR="$OUT_DIR/Codex PR Bot.app"
+mkdir -p "$OUT_DIR"
+ABS_OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+APP_DIR="$ABS_OUT_DIR/Codex PR Bot.app"
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
@@ -47,13 +49,16 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-cp "$ROOT_DIR/daemon/server.py" "$APP_DIR/Contents/Resources/server.py"
 cp "$ROOT_DIR/config.example.json" "$APP_DIR/Contents/Resources/config.example.json"
-chmod +x "$APP_DIR/Contents/Resources/server.py"
 
+echo "==> Building Go daemon (codex-pr-botd)..."
+(cd "$ROOT_DIR/daemon" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$APP_DIR/Contents/MacOS/codex-pr-botd" .)
+
+echo "==> Building SwiftUI menu bar app (CodexPRBot)..."
 swiftc -O -parse-as-library -framework SwiftUI -framework AppKit \
   "$ROOT_DIR/app/CodexPRBot.swift" \
   -o "$APP_DIR/Contents/MacOS/CodexPRBot"
 
 codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+ls -lh "$APP_DIR/Contents/MacOS/"
 echo "Built: $APP_DIR (v$VERSION)"
