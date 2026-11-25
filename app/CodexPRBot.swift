@@ -507,6 +507,7 @@ struct PopoverView: View {
     @ObservedObject var store: BotStore
     @State private var tab: PopoverTab = .prs
     @State private var expandedHistoryID: String?
+    @State private var expandedTraceID: String?
     @State private var notePR: OpenPR?
     @State private var noteText = ""
     @State private var sessionText = ""
@@ -1005,55 +1006,129 @@ struct PopoverView: View {
                         .padding(.top, 2)
 
                     ForEach(store.history.prefix(15)) { item in
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(outcomeColor(item))
-                                    .frame(width: 7, height: 7)
-                                if let u = URL(string: item.url) {
-                                    Link("\(item.displayRepo)#\(item.number)", destination: u)
-                                        .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                        let isExp = expandedTraceID == item.id
+                        VStack(alignment: .leading, spacing: 6) {
+                            Button {
+                                expandedTraceID = isExp ? nil : item.id
+                            } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(outcomeColor(item))
+                                            .frame(width: 7, height: 7)
+                                        Text("\(item.displayRepo)#\(item.number)")
+                                            .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                                            .foregroundStyle(.blue)
+                                        Text(sourceLabel(item.source_kind))
+                                            .font(.system(size: 10))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.primary.opacity(0.08), in: Capsule())
+                                            .foregroundStyle(.secondary)
+                                        Text(outcomeLabel(item))
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 1.5)
+                                            .background(outcomeColor(item).opacity(0.18), in: Capsule())
+                                            .foregroundStyle(outcomeColor(item))
+                                        Spacer()
+                                        Text(String(item.finished_at.suffix(8)))
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                        Image(systemName: isExp ? "chevron.down" : "chevron.right")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    if let steps = item.steps, !steps.isEmpty {
+                                        stepChainRow(steps)
+                                    } else {
+                                        Text("→ \(sourceLabel(item.source_kind)) → Codex Review → \(outcomeLabel(item))")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    HStack {
+                                        Text(item.title)
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        if let u = item.usage, u.netTokens > 0 {
+                                            Text("\(formatTokens(u.netTokens)) token ·")
+                                                .font(.system(size: 10.5, design: .monospaced))
+                                                .foregroundStyle(.cyan.opacity(0.9))
+                                        }
+                                        Text("\(item.duration_sec)s")
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
-                                Text(sourceLabel(item.source_kind))
-                                    .font(.system(size: 10))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(Color.primary.opacity(0.08), in: Capsule())
-                                    .foregroundStyle(.secondary)
-                                Text(outcomeLabel(item))
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1.5)
-                                    .background(outcomeColor(item).opacity(0.18), in: Capsule())
-                                    .foregroundStyle(outcomeColor(item))
-                                Spacer()
-                                Text(String(item.finished_at.suffix(8)))
-                                    .font(.system(size: 10.5, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
 
-                            if let steps = item.steps, !steps.isEmpty {
-                                stepChainRow(steps)
-                            } else {
-                                Text("→ \(sourceLabel(item.source_kind)) → Codex Review → \(outcomeLabel(item))")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                            }
+                            if isExp {
+                                Divider().opacity(0.25)
+                                if let steps = item.steps, !steps.isEmpty {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        ForEach(Array(steps.enumerated()), id: \.offset) { _, st in
+                                            let c: Color = st.status == "done" ? .green : (st.status == "running" ? .orange : .red)
+                                            HStack(alignment: .top, spacing: 6) {
+                                                Circle().fill(c).frame(width: 6, height: 6).padding(.top, 4)
+                                                Text(st.name)
+                                                    .font(.system(size: 11, weight: .semibold))
+                                                    .frame(width: 62, alignment: .leading)
+                                                Text(st.detail)
+                                                    .font(.system(size: 11))
+                                                    .foregroundStyle(.secondary)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                if st.duration_sec > 0 {
+                                                    Text("\(st.duration_sec)s")
+                                                        .font(.system(size: 10, design: .monospaced))
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    .padding(8)
+                                    .background(Color.black.opacity(0.22), in: RoundedRectangle(cornerRadius: 8))
+                                }
 
-                            HStack {
-                                Text(item.title)
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                Spacer()
-                                if let u = item.usage, u.netTokens > 0 {
-                                    Text("\(formatTokens(u.netTokens)) token ·")
+                                if let note = item.fix_note, !note.isEmpty {
+                                    Text("🔧 \(note)")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.blue)
+                                }
+
+                                ScrollView {
+                                    Text(item.body)
                                         .font(.system(size: 10.5, design: .monospaced))
-                                        .foregroundStyle(.cyan.opacity(0.9))
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .textSelection(.enabled)
                                 }
-                                Text("\(item.duration_sec)s")
-                                    .font(.system(size: 10.5, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                .frame(maxHeight: 140)
+                                .padding(8)
+                                .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+
+                                HStack(spacing: 8) {
+                                    Text("Commit \(item.sha8)")
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    if let u = URL(string: item.url) {
+                                        Link("GitHub 打开", destination: u)
+                                            .font(.system(size: 11))
+                                    }
+                                    Button("复制修复指令") {
+                                        let prompt = "请按以下 Codex PR Review 建议修复 PR \(item.repo)#\(item.number)（\(item.title)），修复后运行必要测试并 push 到该 PR 分支：\n\n\(item.body)"
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(prompt, forType: .string)
+                                        store.showToast("已复制修复指令")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
                             }
                         }
                         .padding(.horizontal, 11)
