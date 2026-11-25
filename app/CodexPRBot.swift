@@ -357,7 +357,7 @@ struct PopoverView: View {
                     .lineLimit(2)
                 TextField("可选：重点关注项（留空直接审）", text: $noteText)
                     .textFieldStyle(.roundedBorder)
-                TextField("可选：关联 Agent 会话（claude:<id> 或 codex:<id>）", text: $sessionText)
+                TextField("可选：关联会话（claude / codex / agy / pi / opencode:<id>）", text: $sessionText)
                     .textFieldStyle(.roundedBorder)
                 HStack {
                     Spacer()

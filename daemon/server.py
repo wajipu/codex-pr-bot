@@ -35,8 +35,11 @@ STATE_PATH = DATA_DIR / "state.json"
 HISTORY_PATH = DATA_DIR / "history.json"
 
 BOT_HEADER = "### 🤖 Codex CLI Review"
+SUPPORTED_AGENTS = ("claude", "codex", "agy", "pi", "opencode")
 TRIGGER_RE = re.compile(r"(?i)(?:^|\s)[/@]codex\s+review\b")
-SESSION_RE = re.compile(r"(?i)(?:<!--\s*agent-session\s*:\s*|agent-session\s*:\s*)(claude|codex)\s*:\s*([A-Za-z0-9_.-]+)")
+SESSION_RE = re.compile(
+    r"(?i)(?:<!--\s*agent-session\s*:\s*|agent-session\s*:\s*)(claude|codex|agy|pi|opencode|[a-z0-9_-]+)\s*:\s*([A-Za-z0-9_./-]+)"
+)
 NO_SQUASH_RE = re.compile(r"(?i)(勿\s*squash|不要\s*squash|保留提交|no\s*squash|use\s+merge\s+commit)")
 NO_MERGE_RE = re.compile(r"(?i)(勿自动合并|不要自动合并|do\s+not\s+auto[\s-]?merge|\[wip\])")
 
@@ -187,6 +190,27 @@ class BotRuntime:
             cfg.get("claude_bin"),
             "claude",
             ["/opt/homebrew/bin/claude", "/usr/local/bin/claude", "~/.local/bin/claude"],
+        )
+
+    def agy_bin(self, cfg: dict) -> str:
+        return find_bin(
+            cfg.get("agy_bin"),
+            "agy",
+            ["~/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"],
+        )
+
+    def pi_bin(self, cfg: dict) -> str:
+        return find_bin(
+            cfg.get("pi_bin"),
+            "pi",
+            ["/opt/homebrew/bin/pi", "/usr/local/bin/pi", "~/.local/bin/pi"],
+        )
+
+    def opencode_bin(self, cfg: dict) -> str:
+        return find_bin(
+            cfg.get("opencode_bin"),
+            "opencode",
+            ["/opt/homebrew/bin/opencode", "/usr/local/bin/opencode", "~/.local/bin/opencode"],
         )
 
     def run_cmd(
@@ -434,8 +458,10 @@ class BotRuntime:
     def trigger_manual_pr(self, repo: str, number: int, note: str = "", session_spec: str = "") -> tuple[bool, str]:
         if session_spec and ":" in session_spec:
             ag, sid = session_spec.split(":", 1)
-            if ag.strip().lower() in ("claude", "codex") and sid.strip():
-                self.bind_session(repo, number, ag.strip().lower(), sid.strip())
+            ag_clean = ag.strip().lower()
+            custom_names = set((self.cfg.get("custom_agents") or {}).keys())
+            if (ag_clean in SUPPORTED_AGENTS or ag_clean in custom_names) and sid.strip():
+                self.bind_session(repo, number, ag_clean, sid.strip())
 
         cfg = self.reload_config()
         gh = self.gh_bin(cfg)
@@ -507,8 +533,10 @@ class BotRuntime:
                 "3. 不要合并 PR，不要改无关代码。完成后用一句话总结修复内容。"
             )
 
-            use_agent = agent_type or (cfg.get("fallback_fixer") or "codex").lower()
+            use_agent = (agent_type or (cfg.get("fallback_fixer") or "codex")).lower()
             timeout_s = int(cfg.get("fix_timeout_seconds", 900))
+            custom_agents = cfg.get("custom_agents") or {}
+            stdin_prompt: str | None = None
 
             if use_agent == "claude":
                 claude = self.claude_bin(cfg)
@@ -518,10 +546,47 @@ class BotRuntime:
                 else:
                     set_stage("启动新 Claude 会话自动修复中...")
                     cmd = [claude, "-p", fix_prompt, "--permission-mode", "acceptEdits"]
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(wt_path))
+            elif use_agent == "agy":
+                agy = self.agy_bin(cfg)
+                if sess_id:
+                    set_stage(f"恢复 Antigravity (agy) 会话 ({sess_id[:8]}) 自动修复中...")
+                    cmd = [agy, "--resume", sess_id, "--mode", "accept-edits", "-p", fix_prompt]
+                else:
+                    set_stage("启动新 Antigravity (agy) 会话自动修复中...")
+                    cmd = [agy, "--mode", "accept-edits", "-p", fix_prompt]
+            elif use_agent == "pi":
+                pi = self.pi_bin(cfg)
+                if sess_id:
+                    set_stage(f"恢复 Pi 会话 ({sess_id[:8]}) 自动修复中...")
+                    cmd = [pi, "--session", sess_id, "-p", fix_prompt]
+                else:
+                    set_stage("启动新 Pi 会话自动修复中...")
+                    cmd = [pi, "-p", fix_prompt]
+            elif use_agent == "opencode":
+                opencode = self.opencode_bin(cfg)
+                if sess_id:
+                    set_stage(f"恢复 OpenCode 会话 ({sess_id[:8]}) 自动修复中...")
+                    cmd = [opencode, "run", "--session", sess_id, "--auto", fix_prompt]
+                else:
+                    set_stage("启动新 OpenCode 会话自动修复中...")
+                    cmd = [opencode, "run", "--auto", fix_prompt]
+            elif use_agent in custom_agents:
+                spec = custom_agents[use_agent]
+                tpl = spec.get("resume") if (sess_id and spec.get("resume")) else spec.get("fresh")
+                if not tpl:
+                    return False, f"custom_agents.{use_agent} 未配置命令行模板"
+                set_stage(f"运行自定义 Agent {use_agent} 自动修复中...")
+                cmd = [
+                    str(arg)
+                    .replace("{session_id}", sess_id or "")
+                    .replace("{prompt}", fix_prompt)
+                    .replace("{cwd}", str(wt_path))
+                    for arg in tpl
+                ]
             else:
                 codex = self.codex_bin(cfg)
                 effort = (cfg.get("reasoning_effort") or "high").strip()
+                stdin_prompt = fix_prompt
                 if sess_id:
                     set_stage(f"恢复 Codex 会话 ({sess_id[:8]}) 自动修复中...")
                     cmd = [
@@ -543,16 +608,17 @@ class BotRuntime:
                         "-c", f'model_reasoning_effort="{effort}"',
                         "-",
                     ]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    cwd=str(wt_path),
-                )
-                assert proc.stdin is not None
-                proc.stdin.write(fix_prompt)
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE if stdin_prompt is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(wt_path),
+            )
+            if stdin_prompt is not None and proc.stdin is not None:
+                proc.stdin.write(stdin_prompt)
                 proc.stdin.close()
 
             assert proc.stdout is not None

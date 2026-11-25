@@ -15,7 +15,7 @@
   - 内置 GitHub Releases **自动检查更新**。
 - **多并发 + 闭环自动派修 & 自动合并**：
   - 默认 3 并发并行执行 `codex exec -s read-only`。
-  - **关联 Agent 会话自动修复**：PR 正文或评论含 `<!-- agent-session: claude:<id> -->` / `<!-- agent-session: codex:<id> -->`（或在面板里手动绑定）时，Review 不通过会在隔离的 `git worktree` 中直接 `resume` 原会话修复并推送（未写会话 ID 时自动降级新开会话，上限 2 轮防死循环）。
+  - **关联任意 Agent 会话自动修复**：支持 `claude`、`codex`、`agy`（Antigravity CLI）、`pi`、`opencode` 及自定义 `custom_agents`。PR 正文或评论含 `<!-- agent-session: <agent>:<id> -->`（或在面板里手动绑定）时，Review 不通过会在隔离的 `git worktree` 中直接 `resume` 原会话修复并推送（未写会话 ID 时自动降级新开会话，上限 2 轮防死循环）。
   - **通过自动合并 + 测试清单提醒**：Review 通过自动 `--squash --delete-branch` 合并（正文声明「勿 squash / 保留提交」时自动改 `--merge`），并弹出 macOS 系统通知 + 面板高亮展示 **🧪 待测试功能清单**。
 - **macOS 原生通知**：审查通过（`✅`）、建议修改（`⚠️`）、发现高风险或执行失败（`❌`）自动弹出系统通知。
 
