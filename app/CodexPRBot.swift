@@ -83,9 +83,10 @@ struct ActiveTask: Codable, Identifiable, Equatable, Sendable {
     let trigger_info: String
     let stage: String
     let elapsed_sec: Int
-    let live_lines: [String]
+    let live_lines: [String]?
     let steps: [PipelineStep]?
 
+    var safeLiveLines: [String] { live_lines ?? [] }
     var displayRepo: String {
         if let s = short_repo, !s.isEmpty { return s }
         return String(repo.split(separator: "/").last ?? Substring(repo))
@@ -967,7 +968,7 @@ struct PopoverView: View {
                             stepChainRow(steps)
                         }
 
-                        Text(t.live_lines.isEmpty ? t.stage : t.live_lines.suffix(5).joined(separator: "\n"))
+                        Text(t.safeLiveLines.isEmpty ? t.stage : t.safeLiveLines.suffix(5).joined(separator: "\n"))
                             .font(.system(size: 10.5, design: .monospaced))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .lineLimit(5)

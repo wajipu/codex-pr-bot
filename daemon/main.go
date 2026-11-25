@@ -1715,8 +1715,10 @@ func (b *Bot) snapshot() Snapshot {
 	for _, cur := range b.activeTasks {
 		cp := *cur
 		cp.ElapsedSec = int(now - cur.StartedTS)
-		cp.LiveLines = append([]string(nil), cur.LiveLines...)
-		cp.Steps = append([]PipelineStep(nil), cur.Steps...)
+		cp.LiveLines = make([]string, len(cur.LiveLines))
+		copy(cp.LiveLines, cur.LiveLines)
+		cp.Steps = make([]PipelineStep, len(cur.Steps))
+		copy(cp.Steps, cur.Steps)
 		actives = append(actives, cp)
 	}
 	sort.Slice(actives, func(i, j int) bool { return actives[i].StartedTS < actives[j].StartedTS })
