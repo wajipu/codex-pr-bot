@@ -1,5 +1,36 @@
 import SwiftUI
 import AppKit
+import UserNotifications
+
+// MARK: - Native macOS Notification Center Delegate
+
+final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
+    static let shared = NotificationDelegate()
+
+    func setup() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
+
+    func send(title: String, subtitle: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.subtitle = subtitle
+        content.body = body
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req) { _ in }
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound, .list])
+    }
+}
 
 // MARK: - Models
 
@@ -156,12 +187,15 @@ final class BotStore: ObservableObject {
     private let baseURL = URL(string: "http://127.0.0.1:18787")!
     private let localSession: URLSession
     private var pollTask: Task<Void, Never>?
+    private var lastNotifiedHistoryID: String?
+    private var initializedHistory = false
 
     init() {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:] // bypass proxy for localhost
         cfg.timeoutIntervalForRequest = 4
         self.localSession = URLSession(configuration: cfg)
+        NotificationDelegate.shared.setup()
         startPolling()
         checkForUpdates(silent: true)
     }
@@ -205,8 +239,43 @@ final class BotStore: ObservableObject {
         if activeTasks != d.active_tasks { activeTasks = d.active_tasks }
         if pendingQueue != d.pending_queue { pendingQueue = d.pending_queue }
         if openPRs != d.open_prs { openPRs = d.open_prs }
-        if history != d.history { history = d.history }
+        if history != d.history {
+            if initializedHistory, let newest = d.history.first, newest.id != lastNotifiedHistoryID {
+                notifyForHistory(newest)
+            }
+            lastNotifiedHistoryID = d.history.first?.id
+            initializedHistory = true
+            history = d.history
+        } else if !initializedHistory {
+            lastNotifiedHistoryID = d.history.first?.id
+            initializedHistory = true
+        }
         if logs != d.logs { logs = d.logs }
+    }
+
+    private func notifyForHistory(_ item: HistoryItem) {
+        let sub = "\(item.displayRepo)#\(item.number) (\(item.sha8)) · \(item.duration_sec)s"
+        if !item.ok {
+            NotificationDelegate.shared.send(title: "❌ Codex Review 失败", subtitle: sub, body: item.summary)
+        } else if item.merged == true {
+            let preview = (item.test_checklist?.prefix(2).joined(separator: "；")) ?? "无额外真机测试项"
+            NotificationDelegate.shared.send(title: "🎉 PR 已通过并自动合并 · 请测试", subtitle: sub, body: "待测：\(preview)")
+        } else if item.fix_dispatched == true {
+            NotificationDelegate.shared.send(title: "🔧 已自动派回 Agent 修复", subtitle: sub, body: item.fix_note ?? item.summary)
+        } else if item.verdict == "PASS" {
+            NotificationDelegate.shared.send(title: "✅ Codex Review 通过", subtitle: sub, body: item.summary)
+        } else {
+            NotificationDelegate.shared.send(title: "⚠️ PR 建议修改后再合并", subtitle: sub, body: item.summary)
+        }
+    }
+
+    func sendTestNotification() {
+        NotificationDelegate.shared.send(
+            title: "✅ Codex PR Bot 通知正常",
+            subtitle: "原生 macOS 通知已启用",
+            body: "PR 审查通过、自动派修或合并后都会在这里弹窗提醒"
+        )
+        showToast("已发送测试通知（如未弹出请在系统设置→通知开启 Codex PR Bot）")
     }
 
     func refreshNow() {
@@ -515,6 +584,15 @@ struct PopoverView: View {
             }
             .buttonStyle(.plain)
             .help(store.latestVersion != nil ? "打开 GitHub 下载新版本" : "检查 GitHub Releases 更新")
+
+            Button { store.sendTestNotification() } label: {
+                Image(systemName: "bell")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("发送测试通知")
 
             Button { store.triggerScan() } label: {
                 Image(systemName: "arrow.clockwise")

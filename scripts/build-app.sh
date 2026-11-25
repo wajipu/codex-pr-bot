@@ -55,7 +55,7 @@ echo "==> Building Go daemon (codex-pr-botd)..."
 (cd "$ROOT_DIR/daemon" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$APP_DIR/Contents/MacOS/codex-pr-botd" .)
 
 echo "==> Building SwiftUI menu bar app (CodexPRBot)..."
-swiftc -O -parse-as-library -framework SwiftUI -framework AppKit \
+swiftc -O -parse-as-library -framework SwiftUI -framework AppKit -framework UserNotifications \
   "$ROOT_DIR/app/CodexPRBot.swift" \
   -o "$APP_DIR/Contents/MacOS/CodexPRBot"
 
