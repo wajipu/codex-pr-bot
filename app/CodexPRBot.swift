@@ -435,6 +435,17 @@ final class BotStore: ObservableObject {
         }
     }
 
+    func mergePR(repo: String, number: Int) {
+        Task {
+            let ok = await post(path: "api/merge", body: [
+                "repo": repo,
+                "number": number
+            ])
+            showToast(ok ? "🎉 已合并 \(repo.split(separator: "/").last ?? "")#\(number)" : "合并失败，请检查日志/冲突")
+            refreshNow()
+        }
+    }
+
     func fetchConfig() async -> BotConfigPayload? {
         let session = self.localSession
         let url = self.baseURL.appendingPathComponent("api/config")
@@ -1005,8 +1016,10 @@ struct PopoverView: View {
                         .foregroundStyle(.secondary)
                         .padding(.top, 2)
 
+                    let openKeysTrace = Set(store.openPRs.map { "\($0.repo)#\($0.number)" })
                     ForEach(store.history.prefix(15)) { item in
                         let isExp = expandedTraceID == item.id
+                        let isStillOpen = item.merged != true && openKeysTrace.contains("\(item.repo)#\(item.number)")
                         VStack(alignment: .leading, spacing: 6) {
                             Button {
                                 expandedTraceID = isExp ? nil : item.id
@@ -1014,7 +1027,7 @@ struct PopoverView: View {
                                 VStack(alignment: .leading, spacing: 5) {
                                     HStack(spacing: 6) {
                                         Circle()
-                                            .fill(outcomeColor(item))
+                                            .fill(isStillOpen ? outcomeColor(item) : Color.purple)
                                             .frame(width: 7, height: 7)
                                         Text("\(item.displayRepo)#\(item.number)")
                                             .font(.system(size: 12.5, weight: .bold, design: .monospaced))
@@ -1025,12 +1038,12 @@ struct PopoverView: View {
                                             .padding(.vertical, 1)
                                             .background(Color.primary.opacity(0.08), in: Capsule())
                                             .foregroundStyle(.secondary)
-                                        Text(outcomeLabel(item))
+                                        Text(isStillOpen ? outcomeLabel(item) : "已合并/关闭")
                                             .font(.system(size: 10, weight: .semibold))
                                             .padding(.horizontal, 6)
                                             .padding(.vertical, 1.5)
-                                            .background(outcomeColor(item).opacity(0.18), in: Capsule())
-                                            .foregroundStyle(outcomeColor(item))
+                                            .background((isStillOpen ? outcomeColor(item) : Color.purple).opacity(0.18), in: Capsule())
+                                            .foregroundStyle(isStillOpen ? outcomeColor(item) : Color.purple)
                                         Spacer()
                                         Text(String(item.finished_at.suffix(8)))
                                             .font(.system(size: 10.5, design: .monospaced))
@@ -1111,16 +1124,16 @@ struct PopoverView: View {
                                 .padding(8)
                                 .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
 
-                                HStack(spacing: 8) {
-                                    Text("Commit \(item.sha8)")
+                                HStack(spacing: 6) {
+                                    Text(item.sha8)
                                         .font(.system(size: 10.5, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                     Spacer()
                                     if let u = URL(string: item.url) {
-                                        Link("GitHub 打开", destination: u)
+                                        Link("GitHub", destination: u)
                                             .font(.system(size: 11))
                                     }
-                                    Button("复制修复指令") {
+                                    Button("复制指令") {
                                         let prompt = "请按以下 Codex PR Review 建议修复 PR \(item.repo)#\(item.number)（\(item.title)），修复后运行必要测试并 push 到该 PR 分支：\n\n\(item.body)"
                                         NSPasteboard.general.clearContents()
                                         NSPasteboard.general.setString(prompt, forType: .string)
@@ -1128,6 +1141,31 @@ struct PopoverView: View {
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.mini)
+
+                                    if isStillOpen {
+                                        Button("继续修复") {
+                                            if let open = store.openPRs.first(where: { $0.repo == item.repo && $0.number == item.number }),
+                                               let sess = open.agent_session,
+                                               sess.contains(":") {
+                                                let parts = sess.split(separator: ":", maxSplits: 1)
+                                                fixAgent = String(parts[0])
+                                                fixSessionID = String(parts[1])
+                                            } else {
+                                                fixAgent = item.fixer_agent ?? "codex"
+                                                fixSessionID = ""
+                                            }
+                                            fixNote = ""
+                                            fixTarget = item
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+
+                                        Button("直接合并") {
+                                            store.mergePR(repo: item.repo, number: item.number)
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.mini)
+                                    }
                                 }
                             }
                         }

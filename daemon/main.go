@@ -1896,6 +1896,62 @@ func main() {
 		}
 		writeJSON(w, code, map[string]any{"ok": ok, "message": msg})
 	})
+	mux.HandleFunc("/api/merge", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"ok": false})
+			return
+		}
+		var req struct {
+			Repo   string `json:"repo"`
+			Number int    `json:"number"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		repo := strings.TrimSpace(req.Repo)
+		if repo == "" || req.Number <= 0 {
+			writeJSON(w, 400, map[string]any{"ok": false, "message": "缺少 repo 或 number"})
+			return
+		}
+		cfg := bot.reloadConfig()
+		gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+		ctxV, cancelV := context.WithTimeout(context.Background(), 30*time.Second)
+		stdout, _, _ := runCmd(ctxV, "", "", gh, "pr", "view", strconv.Itoa(req.Number), "--repo", repo, "--json", "title,body")
+		cancelV()
+		flag := "--squash"
+		label := "squash"
+		if noSquashRe.MatchString(stdout) {
+			flag = "--merge"
+			label = "merge"
+		}
+		ctxM, cancelM := context.WithTimeout(context.Background(), 60*time.Second)
+		_, stderr, err := runCmd(ctxM, "", "", gh, "pr", "merge", strconv.Itoa(req.Number), "--repo", repo, flag, "--delete-branch")
+		cancelM()
+		if err != nil {
+			msg := "合并失败: " + truncate(strings.TrimSpace(stderr), 160)
+			bot.log(fmt.Sprintf("❌ 手动合并 %s#%d 失败: %s", shortRepoName(repo), req.Number, msg))
+			writeJSON(w, 500, map[string]any{"ok": false, "message": msg})
+			return
+		}
+		bot.mu.Lock()
+		kept := bot.openPRs[:0]
+		for _, p := range bot.openPRs {
+			if !(p.Repo == repo && p.Number == req.Number) {
+				kept = append(kept, p)
+			}
+		}
+		bot.openPRs = kept
+		for i := range bot.history {
+			if bot.history[i].Repo == repo && bot.history[i].Number == req.Number {
+				bot.history[i].Merged = true
+				bot.history[i].Outcome = "merged"
+				bot.history[i].MergeNote = fmt.Sprintf("已手动合并（%s）", label)
+				break
+			}
+		}
+		writeJSONAtomic(bot.historyPath, bot.history)
+		bot.mu.Unlock()
+		bot.log(fmt.Sprintf("🎉 手动合并成功 %s#%d（%s）", shortRepoName(repo), req.Number, label))
+		writeJSON(w, 200, map[string]any{"ok": true, "message": fmt.Sprintf("已合并 %s#%d（%s）", shortRepoName(repo), req.Number, label)})
+	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
