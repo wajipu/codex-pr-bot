@@ -42,7 +42,8 @@ struct ActiveTask: Codable, Identifiable, Equatable, Sendable {
     let steps: [PipelineStep]?
 
     var displayRepo: String {
-        short_repo ?? String(repo.split(separator: "/").last ?? Substring(repo))
+        if let s = short_repo, !s.isEmpty { return s }
+        return String(repo.split(separator: "/").last ?? Substring(repo))
     }
 }
 
@@ -57,7 +58,8 @@ struct QueuedTask: Codable, Identifiable, Equatable, Sendable {
     let trigger_info: String
 
     var displayRepo: String {
-        short_repo ?? String(repo.split(separator: "/").last ?? Substring(repo))
+        if let s = short_repo, !s.isEmpty { return s }
+        return String(repo.split(separator: "/").last ?? Substring(repo))
     }
 }
 
@@ -76,7 +78,8 @@ struct OpenPR: Codable, Identifiable, Equatable, Sendable {
     let agent_session: String?
 
     var displayRepo: String {
-        short_repo ?? String(repo.split(separator: "/").last ?? Substring(repo))
+        if let s = short_repo, !s.isEmpty { return s }
+        return String(repo.split(separator: "/").last ?? Substring(repo))
     }
 }
 
@@ -106,7 +109,8 @@ struct HistoryItem: Codable, Identifiable, Equatable, Sendable {
     let body: String
 
     var displayRepo: String {
-        short_repo ?? String(repo.split(separator: "/").last ?? Substring(repo))
+        if let s = short_repo, !s.isEmpty { return s }
+        return String(repo.split(separator: "/").last ?? Substring(repo))
     }
 }
 
@@ -353,6 +357,7 @@ struct PopoverView: View {
     @State private var fixAgent = "codex"
     @State private var fixSessionID = ""
     @State private var fixNote = ""
+    @State private var showClosedHistory = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -918,146 +923,196 @@ struct PopoverView: View {
     }
 
     private var historyListView: some View {
-        ScrollView {
-            LazyVStack(spacing: 6) {
-                if store.history.isEmpty {
-                    Text("暂无 Review 历史")
-                        .font(.system(size: 12.5))
+        let openKeys = Set(store.openPRs.map { "\($0.repo)#\($0.number)" })
+        let isOpenPR: (HistoryItem) -> Bool = { item in
+            item.merged != true && openKeys.contains("\(item.repo)#\(item.number)")
+        }
+        let sortedAll = store.history.sorted { a, b in
+            let oa = isOpenPR(a), ob = isOpenPR(b)
+            if oa != ob { return oa }
+            return a.finished_at > b.finished_at
+        }
+        let visibleItems = showClosedHistory ? sortedAll : sortedAll.filter { isOpenPR($0) }
+        let closedCount = sortedAll.count - sortedAll.filter { isOpenPR($0) }.count
+
+        return VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Button("未合并 (\(sortedAll.count - closedCount))") {
+                    showClosedHistory = false
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: !showClosedHistory ? .semibold : .regular))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(!showClosedHistory ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06), in: Capsule())
+
+                Button("全部 (\(sortedAll.count))") {
+                    showClosedHistory = true
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: showClosedHistory ? .semibold : .regular))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(showClosedHistory ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06), in: Capsule())
+
+                Spacer()
+                if closedCount > 0 && !showClosedHistory {
+                    Text("已隐藏 \(closedCount) 条已合并/关闭")
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
-                        .padding(.top, 60)
-                } else {
-                    ForEach(store.history) { item in
-                        let isExp = expandedHistoryID == item.id
-                        VStack(alignment: .leading, spacing: 6) {
-                            Button {
-                                expandedHistoryID = isExp ? nil : item.id
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Circle()
-                                        .fill(item.ok ? Color.green : Color.red)
-                                        .frame(width: 8, height: 8)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        HStack(spacing: 6) {
-                                            Text("\(item.displayRepo)#\(item.number)")
-                                                .font(.system(size: 12.5, weight: .bold, design: .monospaced))
-                                            if item.merged == true {
-                                                Text("已合并")
-                                                    .font(.system(size: 9.5, weight: .bold))
-                                                    .padding(.horizontal, 5)
-                                                    .padding(.vertical, 1)
-                                                    .background(Color.purple.opacity(0.22), in: Capsule())
-                                                    .foregroundStyle(.purple)
-                                            } else if item.fix_dispatched == true {
-                                                Text("已派修")
-                                                    .font(.system(size: 9.5, weight: .bold))
-                                                    .padding(.horizontal, 5)
-                                                    .padding(.vertical, 1)
-                                                    .background(Color.blue.opacity(0.22), in: Capsule())
-                                                    .foregroundStyle(.blue)
-                                            }
-                                            Text("\(item.duration_sec)s")
-                                                .font(.system(size: 10.5, design: .monospaced))
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Text(item.summary)
-                                            .font(.system(size: 11.5))
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                    Image(systemName: isExp ? "chevron.down" : "chevron.right")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            if isExp {
-                                Divider().opacity(0.25)
-                                if let tests = item.test_checklist, !tests.isEmpty {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text("🧪 待测试功能清单")
-                                                .font(.system(size: 11, weight: .bold))
-                                                .foregroundStyle(.green)
-                                            Spacer()
-                                            Button("复制清单") {
-                                                let txt = tests.map { "- [ ] \($0)" }.joined(separator: "\n")
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(txt, forType: .string)
-                                                store.showToast("已复制待测试清单")
-                                            }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.mini)
-                                        }
-                                        ForEach(Array(tests.enumerated()), id: \.offset) { _, t in
-                                            Text("• \(t)")
-                                                .font(.system(size: 11))
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                        }
-                                    }
-                                    .padding(8)
-                                    .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-                                }
-                                if let note = item.fix_note, !note.isEmpty {
-                                    Text("🔧 \(note)")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.blue)
-                                }
-                                ScrollView {
-                                    Text(item.body)
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .textSelection(.enabled)
-                                }
-                                .frame(maxHeight: 170)
-                                .padding(8)
-                                .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
-
-                                HStack(spacing: 8) {
-                                    Text(item.finished_at.replacingOccurrences(of: "T", with: " "))
-                                        .font(.system(size: 10.5))
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    if let u = URL(string: item.url) {
-                                        Link("GitHub", destination: u).font(.system(size: 11.5))
-                                    }
-                                    Button("复制") {
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(item.body, forType: .string)
-                                        store.showToast("已复制")
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.mini)
-
-                                    Button("发送给 Agent") {
-                                        // Pre-fill bound agent/session if present on this open PR
-                                        if let open = store.openPRs.first(where: { $0.repo == item.repo && $0.number == item.number }),
-                                           let sess = open.agent_session,
-                                           sess.contains(":") {
-                                            let parts = sess.split(separator: ":", maxSplits: 1)
-                                            fixAgent = String(parts[0])
-                                            fixSessionID = String(parts[1])
-                                        } else {
-                                            fixAgent = item.fixer_agent ?? "codex"
-                                            fixSessionID = ""
-                                        }
-                                        fixNote = ""
-                                        fixTarget = item
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .controlSize(.mini)
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    }
                 }
             }
-            .padding(12)
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    if visibleItems.isEmpty {
+                        Text(showClosedHistory ? "暂无 Review 历史" : "当前没有未合并的 PR 审查记录（可切到「全部」查看已合并历史）")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 50)
+                            .padding(.horizontal, 20)
+                    } else {
+                        ForEach(visibleItems) { item in
+                            let openNow = isOpenPR(item)
+                            let isExp = expandedHistoryID == item.id
+                            VStack(alignment: .leading, spacing: 6) {
+                                Button {
+                                    expandedHistoryID = isExp ? nil : item.id
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Circle()
+                                            .fill(!openNow ? Color.gray : (item.ok ? Color.green : Color.red))
+                                            .frame(width: 8, height: 8)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            HStack(spacing: 6) {
+                                                Text("\(item.displayRepo)#\(item.number)")
+                                                    .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                                                if item.merged == true || !openNow {
+                                                    Text(item.merged == true ? "已合并" : "已关闭/合并")
+                                                        .font(.system(size: 9.5, weight: .semibold))
+                                                        .padding(.horizontal, 5)
+                                                        .padding(.vertical, 1)
+                                                        .background(Color.purple.opacity(0.20), in: Capsule())
+                                                        .foregroundStyle(.purple)
+                                                } else if item.fix_dispatched == true {
+                                                    Text("已派修")
+                                                        .font(.system(size: 9.5, weight: .bold))
+                                                        .padding(.horizontal, 5)
+                                                        .padding(.vertical, 1)
+                                                        .background(Color.blue.opacity(0.22), in: Capsule())
+                                                        .foregroundStyle(.blue)
+                                                }
+                                                Text("\(item.duration_sec)s")
+                                                    .font(.system(size: 10.5, design: .monospaced))
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Text(item.summary)
+                                                .font(.system(size: 11.5))
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                        Spacer()
+                                        Image(systemName: isExp ? "chevron.down" : "chevron.right")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                if isExp {
+                                    Divider().opacity(0.25)
+                                    if let tests = item.test_checklist, !tests.isEmpty {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack {
+                                                Text("🧪 待测试功能清单")
+                                                    .font(.system(size: 11, weight: .bold))
+                                                    .foregroundStyle(.green)
+                                                Spacer()
+                                                Button("复制清单") {
+                                                    let txt = tests.map { "- [ ] \($0)" }.joined(separator: "\n")
+                                                    NSPasteboard.general.clearContents()
+                                                    NSPasteboard.general.setString(txt, forType: .string)
+                                                    store.showToast("已复制待测试清单")
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .controlSize(.mini)
+                                            }
+                                            ForEach(Array(tests.enumerated()), id: \.offset) { _, t in
+                                                Text("• \(t)")
+                                                    .font(.system(size: 11))
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                            }
+                                        }
+                                        .padding(8)
+                                        .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                                    }
+                                    if let note = item.fix_note, !note.isEmpty {
+                                        Text("🔧 \(note)")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.blue)
+                                    }
+                                    ScrollView {
+                                        Text(item.body)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .textSelection(.enabled)
+                                    }
+                                    .frame(maxHeight: 170)
+                                    .padding(8)
+                                    .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+
+                                    HStack(spacing: 8) {
+                                        Text(item.finished_at.replacingOccurrences(of: "T", with: " "))
+                                            .font(.system(size: 10.5))
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        if let u = URL(string: item.url) {
+                                            Link("GitHub", destination: u).font(.system(size: 11.5))
+                                        }
+                                        Button("复制") {
+                                            NSPasteboard.general.clearContents()
+                                            NSPasteboard.general.setString(item.body, forType: .string)
+                                            store.showToast("已复制")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+
+                                        if openNow {
+                                            Button("发送给 Agent") {
+                                                if let open = store.openPRs.first(where: { $0.repo == item.repo && $0.number == item.number }),
+                                                   let sess = open.agent_session,
+                                                   sess.contains(":") {
+                                                    let parts = sess.split(separator: ":", maxSplits: 1)
+                                                    fixAgent = String(parts[0])
+                                                    fixSessionID = String(parts[1])
+                                                } else {
+                                                    fixAgent = item.fixer_agent ?? "codex"
+                                                    fixSessionID = ""
+                                                }
+                                                fixNote = ""
+                                                fixTarget = item
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                            .controlSize(.mini)
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .opacity(openNow ? 1.0 : 0.65)
+                            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+            }
         }
     }
 
