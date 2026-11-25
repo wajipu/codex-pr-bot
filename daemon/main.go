@@ -88,11 +88,27 @@ type SessionBinding struct {
 	SessionID string `json:"session_id"`
 }
 
+type TokenUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	CachedTokens int64 `json:"cached_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+}
+
+func (u *TokenUsage) add(other TokenUsage) {
+	u.InputTokens += other.InputTokens
+	u.CachedTokens += other.CachedTokens
+	u.OutputTokens += other.OutputTokens
+	u.TotalTokens = u.InputTokens + u.OutputTokens
+}
+
 type State struct {
 	SeenAuto        map[string]string         `json:"seen_auto"`
 	SeenCmd         map[string]string         `json:"seen_cmd"`
 	FixRounds       map[string]int            `json:"fix_rounds"`
 	SessionBindings map[string]SessionBinding `json:"session_bindings"`
+	TotalUsage      TokenUsage                `json:"total_usage"`
+	DailyUsage      map[string]TokenUsage     `json:"daily_usage"`
 }
 
 // MARK: - GitHub PR JSON
@@ -194,6 +210,7 @@ type HistoryItem struct {
 	FixNote       string         `json:"fix_note"`
 	TestChecklist []string       `json:"test_checklist"`
 	Steps         []PipelineStep `json:"steps"`
+	Usage         *TokenUsage    `json:"usage,omitempty"`
 	Repo          string         `json:"repo"`
 	ShortRepo     string         `json:"short_repo"`
 	Number        int            `json:"number"`
@@ -219,6 +236,8 @@ type Snapshot struct {
 	OpenPRs      []OpenPR      `json:"open_prs"`
 	History      []HistoryItem `json:"history"`
 	Logs         []string      `json:"logs"`
+	TodayUsage   TokenUsage    `json:"today_usage"`
+	TotalUsage   TokenUsage    `json:"total_usage"`
 }
 
 type reviewJob struct {
@@ -373,6 +392,7 @@ func (b *Bot) loadState() {
 		SeenCmd:         make(map[string]string),
 		FixRounds:       make(map[string]int),
 		SessionBindings: make(map[string]SessionBinding),
+		DailyUsage:      make(map[string]TokenUsage),
 	}
 	if raw, err := os.ReadFile(b.statePath); err == nil {
 		_ = json.Unmarshal(raw, &b.state)
@@ -387,6 +407,9 @@ func (b *Bot) loadState() {
 		}
 		if b.state.SessionBindings == nil {
 			b.state.SessionBindings = make(map[string]SessionBinding)
+		}
+		if b.state.DailyUsage == nil {
+			b.state.DailyUsage = make(map[string]TokenUsage)
 		}
 	}
 }
@@ -963,6 +986,57 @@ func (b *Bot) triggerManualFix(repo string, number int, reviewBody, agent, sessi
 	return true, fmt.Sprintf("已发送给 %s 修复", ag)
 }
 
+func parseCodexJSONLine(line string) (display string, usage *TokenUsage) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return line, nil
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Usage *struct {
+			InputTokens       int64 `json:"input_tokens"`
+			CachedInputTokens int64 `json:"cached_input_tokens"`
+			OutputTokens      int64 `json:"output_tokens"`
+		} `json:"usage"`
+		Item *struct {
+			Type    string `json:"type"`
+			Text    string `json:"text"`
+			Command string `json:"command"`
+		} `json:"item"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &ev); err != nil {
+		return line, nil
+	}
+	switch ev.Type {
+	case "turn.completed":
+		if ev.Usage != nil {
+			u := &TokenUsage{
+				InputTokens:  ev.Usage.InputTokens,
+				CachedTokens: ev.Usage.CachedInputTokens,
+				OutputTokens: ev.Usage.OutputTokens,
+				TotalTokens:  ev.Usage.InputTokens + ev.Usage.OutputTokens,
+			}
+			return fmt.Sprintf("✓ 本轮完成（input=%d, cached=%d, output=%d）", u.InputTokens, u.CachedTokens, u.OutputTokens), u
+		}
+	case "item.completed":
+		if ev.Item != nil {
+			if ev.Item.Command != "" {
+				return "$ " + truncate(ev.Item.Command, 160), nil
+			}
+			if ev.Item.Text != "" {
+				first := strings.SplitN(strings.TrimSpace(ev.Item.Text), "\n", 2)[0]
+				return truncate(first, 180), nil
+			}
+		}
+	case "error":
+		if ev.Message != "" {
+			return "ERR: " + truncate(ev.Message, 180), nil
+		}
+	}
+	return "", nil
+}
+
 func (b *Bot) runStreamingCmd(ctx context.Context, cwd, stdinText string, appendLive func(string), name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if cwd != "" {
@@ -1268,6 +1342,7 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	fixDispatched := false
 	fixNote := ""
 	fixerAgent := ""
+	var totalJobUsage TokenUsage
 
 	func() {
 		startStep("拉取 Diff", "拉取 PR Diff...")
@@ -1301,7 +1376,7 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		defer os.Remove(outPath)
 
 		effort := strings.TrimSpace(cfg.ReasoningEffort)
-		args := []string{"exec", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
+		args := []string{"exec", "--json", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
 		if effort != "" {
 			args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
 		}
@@ -1309,7 +1384,15 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 
 		timeoutS := intDefault(cfg.TimeoutSeconds, 900)
 		ctxCodex, cancelCodex := context.WithTimeout(context.Background(), time.Duration(timeoutS)*time.Second)
-		runErr := b.runStreamingCmd(ctxCodex, workDir, prompt, appendLive, codex, args...)
+		runErr := b.runStreamingCmd(ctxCodex, workDir, prompt, func(line string) {
+			disp, u := parseCodexJSONLine(line)
+			if u != nil {
+				totalJobUsage.add(*u)
+			}
+			if disp != "" {
+				appendLive(disp)
+			}
+		}, codex, args...)
 		cancelCodex()
 
 		outBytes, _ := os.ReadFile(outPath)
@@ -1443,6 +1526,12 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	}
 	b.mu.Unlock()
 
+	var usagePtr *TokenUsage
+	if totalJobUsage.TotalTokens > 0 {
+		u := totalJobUsage
+		usagePtr = &u
+	}
+
 	rec := HistoryItem{
 		ID:            fmt.Sprintf("%d-%d", time.Now().UnixMilli(), workerID),
 		FinishedAt:    nowISO(),
@@ -1458,6 +1547,7 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		FixNote:       fixNote,
 		TestChecklist: testChecklist,
 		Steps:         finalSteps,
+		Usage:         usagePtr,
 		Repo:          repo,
 		ShortRepo:     short,
 		Number:        pr.Number,
@@ -1470,6 +1560,14 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	}
 
 	b.mu.Lock()
+	if totalJobUsage.TotalTokens > 0 {
+		today := time.Now().Format("2006-01-02")
+		b.state.TotalUsage.add(totalJobUsage)
+		du := b.state.DailyUsage[today]
+		du.add(totalJobUsage)
+		b.state.DailyUsage[today] = du
+		writeJSONAtomic(b.statePath, b.state)
+	}
 	b.history = append([]HistoryItem{rec}, b.history...)
 	if len(b.history) > 50 {
 		b.history = b.history[:50]
@@ -1618,6 +1716,7 @@ func (b *Bot) snapshot() Snapshot {
 	logs := make([]string, len(b.logs))
 	copy(logs, b.logs)
 
+	today := time.Now().Format("2006-01-02")
 	return Snapshot{
 		Status:       status,
 		Paused:       b.paused,
@@ -1632,6 +1731,8 @@ func (b *Bot) snapshot() Snapshot {
 		OpenPRs:      openPRs,
 		History:      histCopy,
 		Logs:         logs,
+		TodayUsage:   b.state.DailyUsage[today],
+		TotalUsage:   b.state.TotalUsage,
 	}
 }
 

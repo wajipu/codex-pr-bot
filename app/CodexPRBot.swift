@@ -34,6 +34,13 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate, @u
 
 // MARK: - Models
 
+struct TokenUsage: Codable, Equatable, Sendable {
+    let input_tokens: Int64
+    let cached_tokens: Int64
+    let output_tokens: Int64
+    let total_tokens: Int64
+}
+
 struct BotSnapshot: Codable, Equatable, Sendable {
     let status: String
     let paused: Bool
@@ -46,6 +53,8 @@ struct BotSnapshot: Codable, Equatable, Sendable {
     let open_prs: [OpenPR]
     let history: [HistoryItem]
     let logs: [String]
+    let today_usage: TokenUsage?
+    let total_usage: TokenUsage?
 }
 
 struct PipelineStep: Codable, Equatable, Sendable {
@@ -129,6 +138,7 @@ struct HistoryItem: Codable, Identifiable, Equatable, Sendable {
     let fix_note: String?
     let test_checklist: [String]?
     let steps: [PipelineStep]?
+    let usage: TokenUsage?
     let repo: String
     let short_repo: String?
     let number: Int
@@ -177,6 +187,8 @@ final class BotStore: ObservableObject {
     @Published var openPRs: [OpenPR] = []
     @Published var history: [HistoryItem] = []
     @Published var logs: [String] = []
+    @Published var todayUsage: TokenUsage?
+    @Published var totalUsage: TokenUsage?
     @Published var toastMessage: String?
 
     // Update checker state
@@ -251,6 +263,8 @@ final class BotStore: ObservableObject {
             initializedHistory = true
         }
         if logs != d.logs { logs = d.logs }
+        if todayUsage != d.today_usage { todayUsage = d.today_usage }
+        if totalUsage != d.total_usage { totalUsage = d.total_usage }
     }
 
     private func notifyForHistory(_ item: HistoryItem) {
@@ -801,15 +815,18 @@ struct PopoverView: View {
 
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
-                // Summary Strip (like magpie's 路由 top line)
+                // Summary Strip (like magpie's 路由 top line with token stats)
                 HStack(spacing: 6) {
                     Circle()
                         .fill(isReviewing ? Color.orange : Color.green)
                         .frame(width: 7, height: 7)
-                    Text("累计 \(store.history.count) 次执行 · 已合并 \(mergedCount) · 自动派修 \(fixedCount)")
+                    Text("今日 \(formatTokens(store.todayUsage?.total_tokens ?? 0)) token · 累计 \(formatTokens(store.totalUsage?.total_tokens ?? 0))")
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
                     Spacer()
+                    Text("合并 \(mergedCount) · 派修 \(fixedCount)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 2)
 
@@ -931,7 +948,12 @@ struct PopoverView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                                 Spacer()
-                                Text("耗时 \(item.duration_sec)s")
+                                if let u = item.usage, u.total_tokens > 0 {
+                                    Text("\(formatTokens(u.total_tokens)) token ·")
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(.cyan.opacity(0.9))
+                                }
+                                Text("\(item.duration_sec)s")
                                     .font(.system(size: 10.5, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
@@ -972,6 +994,16 @@ struct PopoverView: View {
                 }
             }
         }
+    }
+
+    private func formatTokens(_ n: Int64) -> String {
+        if n >= 10_000 {
+            return String(format: "%.1f 万", Double(n) / 10_000.0)
+        }
+        if n >= 1_000 {
+            return String(format: "%.1fk", Double(n) / 1_000.0)
+        }
+        return "\(n)"
     }
 
     private func sourceLabel(_ kind: String?) -> String {
@@ -1087,6 +1119,11 @@ struct PopoverView: View {
                                                 Text("\(item.duration_sec)s")
                                                     .font(.system(size: 10.5, design: .monospaced))
                                                     .foregroundStyle(.secondary)
+                                                if let u = item.usage, u.total_tokens > 0 {
+                                                    Text("\(formatTokens(u.total_tokens)) tok")
+                                                        .font(.system(size: 10, design: .monospaced))
+                                                        .foregroundStyle(.cyan.opacity(0.9))
+                                                }
                                             }
                                             Text(item.summary)
                                                 .font(.system(size: 11.5))
@@ -1128,6 +1165,11 @@ struct PopoverView: View {
                                         }
                                         .padding(8)
                                         .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                                    }
+                                    if let u = item.usage, u.total_tokens > 0 {
+                                        Text("Token：共 \(formatTokens(u.total_tokens))（输入 \(formatTokens(u.input_tokens)) · 缓存 \(formatTokens(u.cached_tokens)) · 输出 \(formatTokens(u.output_tokens))）")
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(.cyan.opacity(0.9))
                                     }
                                     if let note = item.fix_note, !note.isEmpty {
                                         Text("🔧 \(note)")
