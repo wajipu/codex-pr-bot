@@ -411,6 +411,13 @@ struct PopoverView: View {
             .frame(width: 380)
         }
         .sheet(item: $fixTarget) { item in
+            let agents: [(id: String, label: String)] = [
+                ("codex", "Codex"),
+                ("claude", "Claude"),
+                ("agy", "agy"),
+                ("pi", "Pi"),
+                ("opencode", "OpenCode"),
+            ]
             VStack(alignment: .leading, spacing: 12) {
                 Text("发送 Review 建议给 Agent 修复")
                     .font(.system(size: 14, weight: .bold))
@@ -419,14 +426,30 @@ struct PopoverView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
 
-                Picker("目标 Agent", selection: $fixAgent) {
-                    Text("Codex").tag("codex")
-                    Text("Claude Code").tag("claude")
-                    Text("Antigravity (agy)").tag("agy")
-                    Text("Pi").tag("pi")
-                    Text("OpenCode").tag("opencode")
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("选择目标 Agent")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 5) {
+                        ForEach(agents, id: \.id) { ag in
+                            let sel = fixAgent == ag.id
+                            Button {
+                                fixAgent = ag.id
+                            } label: {
+                                Text(ag.label)
+                                    .font(.system(size: 11.5, weight: sel ? .semibold : .regular))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                            .fill(sel ? Color.accentColor : Color.primary.opacity(0.08))
+                                    )
+                                    .foregroundStyle(sel ? .white : .primary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
-                .pickerStyle(.segmented)
 
                 TextField("可选：会话 ID（留空则新开会话修复）", text: $fixSessionID)
                     .textFieldStyle(.roundedBorder)
@@ -453,7 +476,7 @@ struct PopoverView: View {
                 }
             }
             .padding(18)
-            .frame(width: 400)
+            .frame(width: 396)
         }
     }
 
