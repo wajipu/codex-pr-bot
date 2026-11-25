@@ -996,6 +996,9 @@ func (b *Bot) triggerManualFix(repo string, number int, reviewBody, agent, sessi
 
 func parseCodexJSONLine(line string) (display string, usage *TokenUsage) {
 	trimmed := strings.TrimSpace(line)
+	if strings.Contains(trimmed, "rmcp::transport::worker") || strings.Contains(trimmed, "codex_skills_extension::host_service") {
+		return "", nil
+	}
 	if !strings.HasPrefix(trimmed, "{") {
 		return line, nil
 	}

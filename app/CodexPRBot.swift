@@ -1140,12 +1140,26 @@ struct PopoverView: View {
             if oa != ob { return oa }
             return a.finished_at > b.finished_at
         }
-        let visibleItems = showClosedHistory ? sortedAll : sortedAll.filter { isOpenPR($0) }
-        let closedCount = sortedAll.count - sortedAll.filter { isOpenPR($0) }.count
+        // In "未合并" mode, deduplicate by PR (keep only the latest run per open PR)
+        var seenPRs = Set<String>()
+        var roundCounts: [String: Int] = [:]
+        for h in sortedAll where isOpenPR(h) {
+            let k = "\(h.repo)#\(h.number)"
+            roundCounts[k, default: 0] += 1
+        }
+        let openLatest: [HistoryItem] = sortedAll.filter { h in
+            guard isOpenPR(h) else { return false }
+            let k = "\(h.repo)#\(h.number)"
+            if seenPRs.contains(k) { return false }
+            seenPRs.insert(k)
+            return true
+        }
+        let visibleItems = showClosedHistory ? sortedAll : openLatest
+        let hiddenCount = sortedAll.count - openLatest.count
 
         return VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Button("未合并 (\(sortedAll.count - closedCount))") {
+                Button("未合并 (\(openLatest.count))") {
                     showClosedHistory = false
                 }
                 .buttonStyle(.plain)
@@ -1154,7 +1168,7 @@ struct PopoverView: View {
                 .padding(.vertical, 4)
                 .background(!showClosedHistory ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06), in: Capsule())
 
-                Button("全部 (\(sortedAll.count))") {
+                Button("全部记录 (\(sortedAll.count))") {
                     showClosedHistory = true
                 }
                 .buttonStyle(.plain)
@@ -1164,8 +1178,8 @@ struct PopoverView: View {
                 .background(showClosedHistory ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06), in: Capsule())
 
                 Spacer()
-                if closedCount > 0 && !showClosedHistory {
-                    Text("已隐藏 \(closedCount) 条已合并/关闭")
+                if hiddenCount > 0 && !showClosedHistory {
+                    Text("已折叠 \(hiddenCount) 条旧轮次/已合并")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
@@ -1199,6 +1213,14 @@ struct PopoverView: View {
                                             HStack(spacing: 6) {
                                                 Text("\(item.displayRepo)#\(item.number)")
                                                     .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                                                if !showClosedHistory, let rc = roundCounts["\(item.repo)#\(item.number)"], rc > 1 {
+                                                    Text("×\(rc)")
+                                                        .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                                                        .padding(.horizontal, 4)
+                                                        .padding(.vertical, 1)
+                                                        .background(Color.primary.opacity(0.09), in: Capsule())
+                                                        .foregroundStyle(.secondary)
+                                                }
                                                 if item.merged == true || !openNow {
                                                     Text(item.merged == true ? "已合并" : "已关闭/合并")
                                                         .font(.system(size: 9.5, weight: .semibold))
@@ -1490,7 +1512,7 @@ struct SettingsSheetView: View {
                             HStack {
                                 Text("最大自动修复轮数").font(.system(size: 12))
                                 Spacer()
-                                Stepper("\(c.max_fix_rounds.wrappedValue) 轮", value: c.max_fix_rounds, in: 1...5)
+                                Stepper("\(c.max_fix_rounds.wrappedValue) 轮", value: c.max_fix_rounds, in: 1...10)
                                     .font(.system(size: 12, design: .monospaced))
                             }
 
