@@ -190,6 +190,7 @@ final class BotStore: ObservableObject {
     @Published var todayUsage: TokenUsage?
     @Published var totalUsage: TokenUsage?
     @Published var toastMessage: String?
+    @Published var lastError: String?
 
     // Update checker state
     @Published var latestVersion: String?
@@ -201,11 +202,21 @@ final class BotStore: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var lastNotifiedHistoryID: String?
     private var initializedHistory = false
+    private var consecutiveFailures = 0
 
     init() {
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.connectionProxyDictionary = [:] // bypass proxy for localhost
-        cfg.timeoutIntervalForRequest = 4
+        // Explicitly disable all system/Clash proxies for 127.0.0.1 IPC
+        cfg.connectionProxyDictionary = [
+            "HTTPEnable": 0,
+            "HTTPSEnable": 0,
+            "SOCKSEnable": 0,
+            "ProxyAutoConfigEnable": 0,
+            "ProxyAutoDiscoveryEnable": 0
+        ]
+        cfg.timeoutIntervalForRequest = 8
+        cfg.timeoutIntervalForResource = 10
+        cfg.waitsForConnectivity = false
         self.localSession = URLSession(configuration: cfg)
         NotificationDelegate.shared.setup()
         startPolling()
@@ -219,21 +230,31 @@ final class BotStore: ObservableObject {
 
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                let decoded: BotSnapshot? = await Task.detached(priority: .utility) {
+                let result: Result<BotSnapshot, Error> = await Task.detached(priority: .utility) {
                     do {
                         let (data, resp) = try await session.data(from: statusURL)
-                        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
-                        return try JSONDecoder().decode(BotSnapshot.self, from: data)
+                        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                            return .failure(NSError(domain: "HTTP", code: code, userInfo: [NSLocalizedDescriptionKey: "HTTP \(code)"]))
+                        }
+                        return .success(try JSONDecoder().decode(BotSnapshot.self, from: data))
                     } catch {
-                        return nil
+                        return .failure(error)
                     }
                 }.value
 
                 guard let self else { return }
-                if let d = decoded {
+                switch result {
+                case .success(let d):
+                    self.consecutiveFailures = 0
+                    self.lastError = nil
                     self.apply(d)
-                } else if self.connected {
-                    self.connected = false
+                case .failure(let err):
+                    self.consecutiveFailures += 1
+                    self.lastError = err.localizedDescription
+                    if self.consecutiveFailures >= 3 && self.connected {
+                        self.connected = false
+                    }
                 }
 
                 let sleepNs: UInt64 = self.activeTasks.isEmpty ? 3_000_000_000 : 1_500_000_000
@@ -712,6 +733,13 @@ struct PopoverView: View {
                 Text("正在连接本地后台服务...")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
+                if let err = store.lastError {
+                    Text(err)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.red.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
                 Button("重试") { store.refreshNow() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)

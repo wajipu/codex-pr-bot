@@ -1210,9 +1210,25 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 		}
 	}
 
-	if err := b.runStreamingCmd(ctxFix, wtPath, stdinText, appendLive, binName, args...); err != nil {
+	var tailLines []string
+	captureLive := func(line string) {
+		appendLive(line)
+		st := strings.TrimSpace(line)
+		if st != "" {
+			tailLines = append(tailLines, truncate(st, 160))
+			if len(tailLines) > 3 {
+				tailLines = tailLines[len(tailLines)-3:]
+			}
+		}
+	}
+
+	if err := b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...); err != nil {
 		if ctxFix.Err() == context.DeadlineExceeded {
 			return false, fmt.Sprintf("自动修复超时（>%ds）", timeoutS)
+		}
+		detail := strings.Join(tailLines, " | ")
+		if detail != "" {
+			return false, fmt.Sprintf("修复 Agent 执行失败 (%v): %s", err, truncate(detail, 240))
 		}
 		return false, fmt.Sprintf("修复 Agent 执行失败: %v", err)
 	}
