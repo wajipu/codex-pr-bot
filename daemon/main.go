@@ -123,22 +123,32 @@ type GHPR struct {
 
 // MARK: - API Models (100% compatible with SwiftUI MenuBar app)
 
+type PipelineStep struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"` // done | running | failed | skipped
+	Detail      string `json:"detail"`
+	DurationSec int    `json:"duration_sec"`
+	At          string `json:"at"`
+}
+
 type ActiveTask struct {
-	ID           string   `json:"id"`
-	WorkerID     int      `json:"worker_id"`
-	Repo         string   `json:"repo"`
-	ShortRepo    string   `json:"short_repo"`
-	Number       int      `json:"number"`
-	Title        string   `json:"title"`
-	URL          string   `json:"url"`
-	Sha8         string   `json:"sha8"`
-	TriggerInfo  string   `json:"trigger_info"`
-	AgentSession *string  `json:"agent_session,omitempty"`
-	StartedAt    string   `json:"started_at"`
-	StartedTS    float64  `json:"started_ts"`
-	Stage        string   `json:"stage"`
-	ElapsedSec   int      `json:"elapsed_sec"`
-	LiveLines    []string `json:"live_lines"`
+	ID           string         `json:"id"`
+	WorkerID     int            `json:"worker_id"`
+	Repo         string         `json:"repo"`
+	ShortRepo    string         `json:"short_repo"`
+	Number       int            `json:"number"`
+	Title        string         `json:"title"`
+	URL          string         `json:"url"`
+	Sha8         string         `json:"sha8"`
+	SourceKind   string         `json:"source_kind"` // auto | comment | manual
+	TriggerInfo  string         `json:"trigger_info"`
+	AgentSession *string        `json:"agent_session,omitempty"`
+	StartedAt    string         `json:"started_at"`
+	StartedTS    float64        `json:"started_ts"`
+	Stage        string         `json:"stage"`
+	ElapsedSec   int            `json:"elapsed_sec"`
+	LiveLines    []string       `json:"live_lines"`
+	Steps        []PipelineStep `json:"steps"`
 }
 
 type QueuedTask struct {
@@ -170,25 +180,29 @@ type OpenPR struct {
 }
 
 type HistoryItem struct {
-	ID            string   `json:"id"`
-	FinishedAt    string   `json:"finished_at"`
-	DurationSec   int      `json:"duration_sec"`
-	OK            bool     `json:"ok"`
-	Verdict       string   `json:"verdict"`
-	Merged        bool     `json:"merged"`
-	MergeNote     string   `json:"merge_note"`
-	FixDispatched bool     `json:"fix_dispatched"`
-	FixNote       string   `json:"fix_note"`
-	TestChecklist []string `json:"test_checklist"`
-	Repo          string   `json:"repo"`
-	ShortRepo     string   `json:"short_repo"`
-	Number        int      `json:"number"`
-	Title         string   `json:"title"`
-	URL           string   `json:"url"`
-	Sha8          string   `json:"sha8"`
-	TriggerInfo   string   `json:"trigger_info"`
-	Summary       string   `json:"summary"`
-	Body          string   `json:"body"`
+	ID            string         `json:"id"`
+	FinishedAt    string         `json:"finished_at"`
+	DurationSec   int            `json:"duration_sec"`
+	OK            bool           `json:"ok"`
+	Verdict       string         `json:"verdict"`
+	Outcome       string         `json:"outcome"` // merged | fixed | passed | changes | failed
+	SourceKind    string         `json:"source_kind"`
+	FixerAgent    string         `json:"fixer_agent,omitempty"`
+	Merged        bool           `json:"merged"`
+	MergeNote     string         `json:"merge_note"`
+	FixDispatched bool           `json:"fix_dispatched"`
+	FixNote       string         `json:"fix_note"`
+	TestChecklist []string       `json:"test_checklist"`
+	Steps         []PipelineStep `json:"steps"`
+	Repo          string         `json:"repo"`
+	ShortRepo     string         `json:"short_repo"`
+	Number        int            `json:"number"`
+	Title         string         `json:"title"`
+	URL           string         `json:"url"`
+	Sha8          string         `json:"sha8"`
+	TriggerInfo   string         `json:"trigger_info"`
+	Summary       string         `json:"summary"`
+	Body          string         `json:"body"`
 }
 
 type Snapshot struct {
@@ -977,6 +991,13 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	sha8 := shaPrefix(pr.HeadRefOid)
 	started := time.Now()
 
+	sourceKind := "auto"
+	if strings.HasPrefix(job.StateKey, "cmd|") {
+		sourceKind = "comment"
+	} else if strings.HasPrefix(job.StateKey, "manual|") {
+		sourceKind = "manual"
+	}
+
 	b.mu.Lock()
 	ag, sid := parseAgentSession(pr, b.state.SessionBindings, repo)
 	var sessPtr *string
@@ -991,6 +1012,9 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		}
 	}
 	b.pendingQueue = filtered
+	initSteps := []PipelineStep{
+		{Name: "来源", Status: "done", Detail: job.TriggerInfo, DurationSec: 0, At: time.Now().Format("15:04:05")},
+	}
 	b.activeTasks[job.StateKey] = &ActiveTask{
 		ID:           job.StateKey,
 		WorkerID:     workerID,
@@ -1000,15 +1024,45 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		Title:        pr.Title,
 		URL:          pr.URL,
 		Sha8:         sha8,
+		SourceKind:   sourceKind,
 		TriggerInfo:  job.TriggerInfo,
 		AgentSession: sessPtr,
 		StartedAt:    nowISO(),
 		StartedTS:    float64(started.UnixNano()) / 1e9,
 		Stage:        "拉取 PR Diff...",
 		LiveLines:    []string{},
+		Steps:        initSteps,
 	}
 	b.mu.Unlock()
 
+	var stepStarted time.Time
+	startStep := func(name, detail string) {
+		stepStarted = time.Now()
+		b.mu.Lock()
+		if cur, ok := b.activeTasks[job.StateKey]; ok {
+			cur.Stage = detail
+			cur.Steps = append(cur.Steps, PipelineStep{
+				Name:   name,
+				Status: "running",
+				Detail: detail,
+				At:     stepStarted.Format("15:04:05"),
+			})
+		}
+		b.mu.Unlock()
+	}
+	finishStep := func(status, detail string) {
+		dur := int(time.Since(stepStarted).Seconds())
+		b.mu.Lock()
+		if cur, ok := b.activeTasks[job.StateKey]; ok && len(cur.Steps) > 0 {
+			last := &cur.Steps[len(cur.Steps)-1]
+			last.Status = status
+			if detail != "" {
+				last.Detail = detail
+			}
+			last.DurationSec = dur
+		}
+		b.mu.Unlock()
+	}
 	setStage := func(st string) {
 		b.mu.Lock()
 		if cur, ok := b.activeTasks[job.StateKey]; ok {
@@ -1042,15 +1096,19 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	mergeNote := ""
 	fixDispatched := false
 	fixNote := ""
+	fixerAgent := ""
 
 	func() {
+		startStep("拉取 Diff", "拉取 PR Diff...")
 		ctxDiff, cancelDiff := context.WithTimeout(context.Background(), 60*time.Second)
 		diffText, stderr, err := runCmd(ctxDiff, "", "", gh, "pr", "diff", strconv.Itoa(pr.Number), "--repo", repo)
 		cancelDiff()
 		if err != nil {
 			errorMsg = "gh pr diff 失败: " + truncate(strings.TrimSpace(stderr), 180)
+			finishStep("failed", errorMsg)
 			return
 		}
+		finishStep("done", fmt.Sprintf("%d 字符", len(diffText)))
 
 		maxDiff := intDefault(cfg.MaxDiffChars, 120000)
 		if len(diffText) > maxDiff {
@@ -1060,10 +1118,11 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		workDir, agentsMD := b.readLocalAgentsMD(cfg, repo)
 		prompt := b.buildReviewPrompt(repo, pr, diffText, job.TriggerInfo, agentsMD)
 
-		setStage("运行本机 Codex CLI 审查中...")
+		startStep("Codex 审查", "运行本机 Codex CLI 审查中...")
 		tmpFile, err := os.CreateTemp("", "codex-review-*.md")
 		if err != nil {
 			errorMsg = "创建临时文件失败"
+			finishStep("failed", errorMsg)
 			return
 		}
 		outPath := tmpFile.Name()
@@ -1090,13 +1149,15 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 			} else {
 				errorMsg = fmt.Sprintf("codex exec 失败: %v", runErr)
 			}
+			finishStep("failed", errorMsg)
 			return
 		}
 
 		verdict = classifyVerdict(reviewBody)
 		testChecklist = extractTestChecklist(reviewBody)
+		finishStep("done", verdict)
 
-		setStage("回写 GitHub PR 评论...")
+		startStep("回写评论", "回写 GitHub PR 评论...")
 		commentBody := fmt.Sprintf("%s (`%s`)\n\n%s\n\n<sub>触发：%s</sub>\n%s\n",
 			botHeader, sha8, reviewBody, job.TriggerInfo, job.Marker)
 		ctxPost, cancelPost := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1104,8 +1165,10 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		cancelPost()
 		if err != nil {
 			errorMsg = "gh pr comment 失败: " + truncate(strings.TrimSpace(stderr), 180)
+			finishStep("failed", errorMsg)
 			return
 		}
+		finishStep("done", "已评论到 PR")
 
 		ok = true
 		b.log(fmt.Sprintf("[Worker #%d] 审查完成 %s#%d -> %s", workerID, short, pr.Number, verdict))
@@ -1119,16 +1182,18 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 				flag = "--merge"
 				label = "merge"
 			}
-			setStage(fmt.Sprintf("审查通过，自动合并（%s）...", label))
+			startStep("自动合并", fmt.Sprintf("审查通过，自动合并（%s）...", label))
 			ctxM, cancelM := context.WithTimeout(context.Background(), 60*time.Second)
 			_, stderr, err = runCmd(ctxM, "", "", gh, "pr", "merge", strconv.Itoa(pr.Number), "--repo", repo, flag, "--delete-branch")
 			cancelM()
 			if err == nil {
 				merged = true
 				mergeNote = fmt.Sprintf("已自动合并（%s）", label)
+				finishStep("done", mergeNote)
 				b.log(fmt.Sprintf("[Worker #%d] 🎉 %s#%d %s", workerID, short, pr.Number, mergeNote))
 			} else {
 				mergeNote = "自动合并失败: " + truncate(strings.TrimSpace(stderr), 140)
+				finishStep("failed", mergeNote)
 				b.log(fmt.Sprintf("[Worker #%d] ⚠️ %s#%d %s", workerID, short, pr.Number, mergeNote))
 			}
 		} else if verdict == "CHANGES_REQUESTED" && boolDefault(cfg.AutoFix, true) {
@@ -1142,17 +1207,27 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 				writeJSONAtomic(b.statePath, b.state)
 				b.mu.Unlock()
 
+				fixerAgent = ag
+				if fixerAgent == "" {
+					fixerAgent = strings.ToLower(cfg.FallbackFixer)
+					if fixerAgent == "" {
+						fixerAgent = "codex"
+					}
+				}
+				startStep("自动派修", fmt.Sprintf("派给 %s 修复（第 %d/%d 轮）...", fixerAgent, used+1, maxRounds))
 				b.log(fmt.Sprintf("[Worker #%d] 🔧 派发自动修复 %s#%d（第 %d/%d 轮）", workerID, short, pr.Number, used+1, maxRounds))
 				fixOK, fNote := b.runAutoFix(cfg, repo, pr, reviewBody, ag, sid, setStage, appendLive)
 				fixDispatched = fixOK
 				fixNote = fNote
 				if fixOK {
+					finishStep("done", fNote)
 					b.log(fmt.Sprintf("[Worker #%d] ✅ %s", workerID, fNote))
 					select {
 					case b.wakeScan <- struct{}{}:
 					default:
 					}
 				} else {
+					finishStep("failed", fNote)
 					b.log(fmt.Sprintf("[Worker #%d] ❌ %s", workerID, fNote))
 				}
 			} else {
@@ -1177,17 +1252,41 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	}
 	firstLine = truncate(strings.TrimSpace(firstLine), 180)
 
+	outcome := "failed"
+	if ok {
+		if merged {
+			outcome = "merged"
+		} else if fixDispatched {
+			outcome = "fixed"
+		} else if verdict == "PASS" {
+			outcome = "passed"
+		} else {
+			outcome = "changes"
+		}
+	}
+
+	b.mu.Lock()
+	var finalSteps []PipelineStep
+	if cur, exists := b.activeTasks[job.StateKey]; exists {
+		finalSteps = append([]PipelineStep(nil), cur.Steps...)
+	}
+	b.mu.Unlock()
+
 	rec := HistoryItem{
 		ID:            fmt.Sprintf("%d-%d", time.Now().UnixMilli(), workerID),
 		FinishedAt:    nowISO(),
 		DurationSec:   duration,
 		OK:            ok,
 		Verdict:       verdict,
+		Outcome:       outcome,
+		SourceKind:    sourceKind,
+		FixerAgent:    fixerAgent,
 		Merged:        merged,
 		MergeNote:     mergeNote,
 		FixDispatched: fixDispatched,
 		FixNote:       fixNote,
 		TestChecklist: testChecklist,
+		Steps:         finalSteps,
 		Repo:          repo,
 		ShortRepo:     short,
 		Number:        pr.Number,
@@ -1309,6 +1408,7 @@ func (b *Bot) snapshot() Snapshot {
 		cp := *cur
 		cp.ElapsedSec = int(now - cur.StartedTS)
 		cp.LiveLines = append([]string(nil), cur.LiveLines...)
+		cp.Steps = append([]PipelineStep(nil), cur.Steps...)
 		actives = append(actives, cp)
 	}
 	sort.Slice(actives, func(i, j int) bool { return actives[i].StartedTS < actives[j].StartedTS })

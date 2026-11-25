@@ -17,6 +17,14 @@ struct BotSnapshot: Codable, Equatable, Sendable {
     let logs: [String]
 }
 
+struct PipelineStep: Codable, Equatable, Sendable {
+    let name: String
+    let status: String // done | running | failed | skipped
+    let detail: String
+    let duration_sec: Int
+    let at: String
+}
+
 struct ActiveTask: Codable, Identifiable, Equatable, Sendable {
     let id: String
     let worker_id: Int
@@ -26,10 +34,12 @@ struct ActiveTask: Codable, Identifiable, Equatable, Sendable {
     let title: String
     let url: String
     let sha8: String
+    let source_kind: String?
     let trigger_info: String
     let stage: String
     let elapsed_sec: Int
     let live_lines: [String]
+    let steps: [PipelineStep]?
 
     var displayRepo: String {
         short_repo ?? String(repo.split(separator: "/").last ?? Substring(repo))
@@ -76,11 +86,15 @@ struct HistoryItem: Codable, Identifiable, Equatable, Sendable {
     let duration_sec: Int
     let ok: Bool
     let verdict: String?
+    let outcome: String?
+    let source_kind: String?
+    let fixer_agent: String?
     let merged: Bool?
     let merge_note: String?
     let fix_dispatched: Bool?
     let fix_note: String?
     let test_checklist: [String]?
+    let steps: [PipelineStep]?
     let repo: String
     let short_repo: String?
     let number: Int
@@ -103,7 +117,7 @@ struct GitHubRelease: Codable, Sendable {
 
 enum PopoverTab: String, CaseIterable, Identifiable {
     case prs = "Open PR"
-    case running = "进行中"
+    case running = "链路"
     case history = "历史"
     case logs = "日志"
 
@@ -609,76 +623,210 @@ struct PopoverView: View {
     }
 
     private var runningListView: some View {
-        ScrollView {
+        let mergedCount = store.history.filter { $0.merged == true }.count
+        let fixedCount = store.history.filter { $0.fix_dispatched == true }.count
+        let activeSources = Set(store.activeTasks.compactMap(\.source_kind))
+        let isReviewing = !store.activeTasks.isEmpty
+
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
-                if store.activeTasks.isEmpty && store.pendingQueue.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle")
-                            .font(.system(size: 30))
-                            .foregroundStyle(.green.opacity(0.85))
-                        Text("当前空闲，等待新 PR 或 @codex review")
-                            .font(.system(size: 12.5))
-                            .foregroundStyle(.secondary)
+                // Summary Strip (like magpie's 路由 top line)
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(isReviewing ? Color.orange : Color.green)
+                        .frame(width: 7, height: 7)
+                    Text("累计 \(store.history.count) 次执行 · 已合并 \(mergedCount) · 自动派修 \(fixedCount)")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 2)
+
+                // Visual Topology Diagram (Source -> Bot -> Review / Fix / Merge)
+                PipelineTopologyCard(
+                    isReviewing: isReviewing,
+                    activeCount: store.activeTasks.count,
+                    activeSources: activeSources,
+                    hasMerged: mergedCount > 0,
+                    hasFixed: fixedCount > 0
+                )
+
+                // Live Active Pipelines
+                ForEach(store.activeTasks) { t in
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(spacing: 6) {
+                            Text("Worker #\(t.worker_id)")
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.2), in: Capsule())
+                                .foregroundStyle(.orange)
+                            if let u = URL(string: t.url) {
+                                Link("\(t.displayRepo)#\(t.number)", destination: u)
+                                    .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                            }
+                            Text(sourceLabel(t.source_kind))
+                                .font(.system(size: 10))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.primary.opacity(0.08), in: Capsule())
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            ProgressView().controlSize(.small)
+                            Text("\(t.elapsed_sec)s")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let steps = t.steps, !steps.isEmpty {
+                            stepChainRow(steps)
+                        }
+
+                        Text(t.live_lines.isEmpty ? t.stage : t.live_lines.suffix(5).joined(separator: "\n"))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .lineLimit(5)
+                            .padding(8)
+                            .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 8))
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 70)
-                } else {
-                    ForEach(store.activeTasks) { t in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text("Worker #\(t.worker_id)")
-                                    .font(.system(size: 10.5, weight: .bold))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.orange.opacity(0.2), in: Capsule())
-                                    .foregroundStyle(.orange)
-                                if let u = URL(string: t.url) {
-                                    Link("\(t.displayRepo)#\(t.number)", destination: u)
+                    .padding(11)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 11))
+                    .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(Color.orange.opacity(0.45), lineWidth: 0.9))
+                }
+
+                if !store.pendingQueue.isEmpty {
+                    Text("等待队列 (\(store.pendingQueue.count))")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(store.pendingQueue) { q in
+                        HStack {
+                            Text("\(q.displayRepo)#\(q.number)")
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            Text(q.title).font(.system(size: 11.5)).lineLimit(1).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(q.sha8).font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.secondary)
+                        }
+                        .padding(9)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+
+                // Recent Execution Trace Cards (magpie 路由 list style)
+                if !store.history.isEmpty {
+                    Text("最近链路轨迹")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+
+                    ForEach(store.history.prefix(15)) { item in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(outcomeColor(item))
+                                    .frame(width: 7, height: 7)
+                                if let u = URL(string: item.url) {
+                                    Link("\(item.displayRepo)#\(item.number)", destination: u)
                                         .font(.system(size: 12.5, weight: .bold, design: .monospaced))
                                 }
+                                Text(sourceLabel(item.source_kind))
+                                    .font(.system(size: 10))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.primary.opacity(0.08), in: Capsule())
+                                    .foregroundStyle(.secondary)
+                                Text(outcomeLabel(item))
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1.5)
+                                    .background(outcomeColor(item).opacity(0.18), in: Capsule())
+                                    .foregroundStyle(outcomeColor(item))
                                 Spacer()
-                                ProgressView().controlSize(.small)
-                                Text("\(t.elapsed_sec)s")
-                                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                                Text(String(item.finished_at.suffix(8)))
+                                    .font(.system(size: 10.5, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
-                            Text(t.title).font(.system(size: 12)).lineLimit(1)
-                            Text("\(t.stage) · \(t.sha8)")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
 
-                            Text(t.live_lines.isEmpty ? "Codex CLI 分析中..." : t.live_lines.suffix(8).joined(separator: "\n"))
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .lineLimit(8)
-                                .padding(8)
-                                .background(Color.black.opacity(0.26), in: RoundedRectangle(cornerRadius: 8))
-                        }
-                        .padding(11)
-                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 11))
-                        .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(Color.orange.opacity(0.4), lineWidth: 0.8))
-                    }
-
-                    if !store.pendingQueue.isEmpty {
-                        Text("等待队列 (\(store.pendingQueue.count))")
-                            .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        ForEach(store.pendingQueue) { q in
-                            HStack {
-                                Text("\(q.displayRepo)#\(q.number)")
-                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                Text(q.title).font(.system(size: 12)).lineLimit(1)
-                                Spacer()
-                                Text(q.sha8).font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.secondary)
+                            if let steps = item.steps, !steps.isEmpty {
+                                stepChainRow(steps)
+                            } else {
+                                Text("→ \(sourceLabel(item.source_kind)) → Codex Review → \(outcomeLabel(item))")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
                             }
-                            .padding(9)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+
+                            HStack {
+                                Text(item.title)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("耗时 \(item.duration_sec)s")
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
                 }
             }
             .padding(12)
         }
+    }
+
+    private func stepChainRow(_ steps: [PipelineStep]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(Array(steps.enumerated()), id: \.offset) { idx, st in
+                    if idx > 0 {
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .foregroundStyle(.secondary.opacity(0.7))
+                    }
+                    let c: Color = st.status == "done" ? .green : (st.status == "running" ? .orange : .red)
+                    HStack(spacing: 3) {
+                        Circle().fill(c).frame(width: 5, height: 5)
+                        Text(st.name)
+                            .font(.system(size: 10.5, weight: .medium))
+                        if st.duration_sec > 0 {
+                            Text("\(st.duration_sec)s")
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2.5)
+                    .background(c.opacity(0.12), in: Capsule())
+                }
+            }
+        }
+    }
+
+    private func sourceLabel(_ kind: String?) -> String {
+        switch kind {
+        case "comment": return "@评论"
+        case "manual": return "手动"
+        default: return "新PR"
+        }
+    }
+
+    private func outcomeLabel(_ item: HistoryItem) -> String {
+        if item.merged == true { return "已合并" }
+        if item.fix_dispatched == true {
+            return item.fixer_agent.map { "\($0) 派修" } ?? "已派修"
+        }
+        if !item.ok { return "失败" }
+        if item.verdict == "PASS" { return "通过" }
+        return "需修改"
+    }
+
+    private func outcomeColor(_ item: HistoryItem) -> Color {
+        if item.merged == true { return .purple }
+        if item.fix_dispatched == true { return .blue }
+        if !item.ok { return .red }
+        if item.verdict == "PASS" { return .green }
+        return .orange
     }
 
     private var historyListView: some View {
@@ -861,6 +1009,118 @@ struct PopoverView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+    }
+}
+
+// MARK: - Visual Flow Topology Card (magpie-style Bezier diagram)
+
+struct PipelineTopologyCard: View {
+    let isReviewing: Bool
+    let activeCount: Int
+    let activeSources: Set<String>
+    let hasMerged: Bool
+    let hasFixed: Bool
+
+    var body: some View {
+        ZStack {
+            // Smooth Bezier connectors
+            Canvas { ctx, size in
+                let midX = size.width * 0.48
+                let midY = size.height * 0.5
+                let leftX = size.width * 0.30
+                let rightX = size.width * 0.66
+                let ys: [CGFloat] = [size.height * 0.23, size.height * 0.50, size.height * 0.77]
+
+                let leftActive = [
+                    activeSources.contains("auto"),
+                    activeSources.contains("comment"),
+                    activeSources.contains("manual")
+                ]
+                let rightActive = [isReviewing, hasFixed, hasMerged]
+                let rightColors: [Color] = [.orange, .blue, .purple]
+
+                for (i, y) in ys.enumerated() {
+                    var lp = Path()
+                    lp.move(to: CGPoint(x: leftX, y: y))
+                    lp.addCurve(
+                        to: CGPoint(x: midX - 20, y: midY),
+                        control1: CGPoint(x: (leftX + midX) * 0.5, y: y),
+                        control2: CGPoint(x: (leftX + midX) * 0.5, y: midY)
+                    )
+                    ctx.stroke(lp, with: .color(leftActive[i] ? .cyan.opacity(0.85) : .white.opacity(0.14)), lineWidth: leftActive[i] ? 1.8 : 1.1)
+
+                    var rp = Path()
+                    rp.move(to: CGPoint(x: midX + 20, y: midY))
+                    rp.addCurve(
+                        to: CGPoint(x: rightX, y: y),
+                        control1: CGPoint(x: (midX + rightX) * 0.5, y: midY),
+                        control2: CGPoint(x: (midX + rightX) * 0.5, y: y)
+                    )
+                    ctx.stroke(rp, with: .color(rightActive[i] ? rightColors[i].opacity(0.8) : .white.opacity(0.14)), lineWidth: rightActive[i] ? 1.8 : 1.1)
+                }
+            }
+
+            HStack(spacing: 0) {
+                // Left: Sources
+                VStack(alignment: .trailing, spacing: 8) {
+                    nodePill(icon: "arrow.triangle.pull", text: "GitHub PR", color: .cyan, lit: activeSources.contains("auto"))
+                    nodePill(icon: "text.bubble", text: "@codex 评论", color: .cyan, lit: activeSources.contains("comment"))
+                    nodePill(icon: "hand.tap", text: "手动触发", color: .cyan, lit: activeSources.contains("manual"))
+                }
+                .frame(width: 118, alignment: .trailing)
+
+                Spacer()
+
+                // Center Hub
+                ZStack {
+                    Circle()
+                        .fill(Color.black.opacity(0.32))
+                        .frame(width: 44, height: 44)
+                        .overlay(
+                            Circle().strokeBorder(
+                                (isReviewing ? Color.orange : Color.white.opacity(0.22)),
+                                lineWidth: isReviewing ? 1.8 : 1
+                            )
+                        )
+                    VStack(spacing: 1) {
+                        Image(systemName: isReviewing ? "bolt.fill" : "cpu")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(isReviewing ? .orange : .cyan)
+                        if isReviewing {
+                            Text("\(activeCount)")
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                // Right: Execution & Outcomes
+                VStack(alignment: .leading, spacing: 8) {
+                    nodePill(icon: "magnifyingglass", text: "Codex 审查", color: .orange, lit: isReviewing)
+                    nodePill(icon: "wrench.and.screwdriver", text: "Agent 派修", color: .blue, lit: hasFixed)
+                    nodePill(icon: "arrow.triangle.merge", text: "自动合并", color: .purple, lit: hasMerged)
+                }
+                .frame(width: 132, alignment: .leading)
+            }
+            .padding(.horizontal, 12)
+        }
+        .frame(height: 112)
+        .background(Color.black.opacity(0.22), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.7))
+    }
+
+    private func nodePill(icon: String, text: String, color: Color, lit: Bool) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(lit ? color : Color.secondary.opacity(0.45)).frame(width: 5.5, height: 5.5)
+            Image(systemName: icon).font(.system(size: 9.5)).foregroundStyle(lit ? color : .secondary)
+            Text(text).font(.system(size: 10.5, weight: lit ? .semibold : .regular))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(lit ? 0.11 : 0.05), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(lit ? color.opacity(0.45) : Color.white.opacity(0.07), lineWidth: 0.7))
     }
 }
 
