@@ -13,9 +13,10 @@
   - 顶部菜单栏常驻，审查时实时显示并发进度（如 `⚡ 2/3`）。
   - 下拉毛玻璃面板查看 Open PR、正在并行 Review 的 Worker 实时输出、历史记录与运行日志。
   - 内置 GitHub Releases **自动检查更新**。
-- **多并发 + 只读安全边界**：
+- **多并发 + 闭环自动派修 & 自动合并**：
   - 默认 3 并发并行执行 `codex exec -s read-only`。
-  - 只回写 GitHub PR 评论（`gh pr comment`），**绝不修改代码、不自动 approve/merge**。
+  - **关联 Agent 会话自动修复**：PR 正文或评论含 `<!-- agent-session: claude:<id> -->` / `<!-- agent-session: codex:<id> -->`（或在面板里手动绑定）时，Review 不通过会在隔离的 `git worktree` 中直接 `resume` 原会话修复并推送（未写会话 ID 时自动降级新开会话，上限 2 轮防死循环）。
+  - **通过自动合并 + 测试清单提醒**：Review 通过自动 `--squash --delete-branch` 合并（正文声明「勿 squash / 保留提交」时自动改 `--merge`），并弹出 macOS 系统通知 + 面板高亮展示 **🧪 待测试功能清单**。
 - **macOS 原生通知**：审查通过（`✅`）、建议修改（`⚠️`）、发现高风险或执行失败（`❌`）自动弹出系统通知。
 
 ## 前置依赖

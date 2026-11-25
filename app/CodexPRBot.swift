@@ -63,6 +63,7 @@ struct OpenPR: Codable, Identifiable, Equatable, Sendable {
     let sha8: String
     let is_draft: Bool
     let reviewed: Bool
+    let agent_session: String?
 
     var displayRepo: String {
         short_repo ?? String(repo.split(separator: "/").last ?? Substring(repo))
@@ -74,6 +75,12 @@ struct HistoryItem: Codable, Identifiable, Equatable, Sendable {
     let finished_at: String
     let duration_sec: Int
     let ok: Bool
+    let verdict: String?
+    let merged: Bool?
+    let merge_note: String?
+    let fix_dispatched: Bool?
+    let fix_note: String?
+    let test_checklist: [String]?
     let repo: String
     let short_repo: String?
     let number: Int
@@ -255,12 +262,13 @@ final class BotStore: ObservableObject {
         }
     }
 
-    func triggerManualReview(repo: String, number: Int, note: String = "") {
+    func triggerManualReview(repo: String, number: Int, note: String = "", agentSession: String = "") {
         Task {
             let ok = await post(path: "api/review", body: [
                 "repo": repo,
                 "number": number,
-                "note": note
+                "note": note,
+                "agent_session": agentSession
             ])
             showToast(ok ? "已加入队列：\(repo.split(separator: "/").last ?? "")#\(number)" : "触发失败")
             refreshNow()
@@ -310,6 +318,7 @@ struct PopoverView: View {
     @State private var expandedHistoryID: String?
     @State private var notePR: OpenPR?
     @State private var noteText = ""
+    @State private var sessionText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -348,13 +357,16 @@ struct PopoverView: View {
                     .lineLimit(2)
                 TextField("可选：重点关注项（留空直接审）", text: $noteText)
                     .textFieldStyle(.roundedBorder)
+                TextField("可选：关联 Agent 会话（claude:<id> 或 codex:<id>）", text: $sessionText)
+                    .textFieldStyle(.roundedBorder)
                 HStack {
                     Spacer()
-                    Button("取消") { notePR = nil; noteText = "" }
+                    Button("取消") { notePR = nil; noteText = ""; sessionText = "" }
                     Button("开始 Review") {
-                        store.triggerManualReview(repo: pr.repo, number: pr.number, note: noteText)
+                        store.triggerManualReview(repo: pr.repo, number: pr.number, note: noteText, agentSession: sessionText)
                         notePR = nil
                         noteText = ""
+                        sessionText = ""
                         tab = .running
                     }
                     .buttonStyle(.borderedProminent)
@@ -362,7 +374,7 @@ struct PopoverView: View {
                 }
             }
             .padding(18)
-            .frame(width: 360)
+            .frame(width: 380)
         }
     }
 
@@ -551,6 +563,14 @@ struct PopoverView: View {
                                     Text(pr.sha8)
                                         .font(.system(size: 10.5, design: .monospaced))
                                         .foregroundStyle(.secondary)
+                                    if let sess = pr.agent_session {
+                                        Text(sess.split(separator: ":").first.map(String.init) ?? "agent")
+                                            .font(.system(size: 9.5, weight: .semibold))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.cyan.opacity(0.18), in: Capsule())
+                                            .foregroundStyle(.cyan)
+                                    }
                                 }
                                 Text(pr.title)
                                     .font(.system(size: 12))
@@ -572,6 +592,7 @@ struct PopoverView: View {
 
                             Button("审") {
                                 noteText = ""
+                                sessionText = pr.agent_session ?? ""
                                 notePR = pr
                             }
                             .buttonStyle(.borderedProminent)
@@ -683,6 +704,21 @@ struct PopoverView: View {
                                         HStack(spacing: 6) {
                                             Text("\(item.displayRepo)#\(item.number)")
                                                 .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                                            if item.merged == true {
+                                                Text("已合并")
+                                                    .font(.system(size: 9.5, weight: .bold))
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 1)
+                                                    .background(Color.purple.opacity(0.22), in: Capsule())
+                                                    .foregroundStyle(.purple)
+                                            } else if item.fix_dispatched == true {
+                                                Text("已派修")
+                                                    .font(.system(size: 9.5, weight: .bold))
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 1)
+                                                    .background(Color.blue.opacity(0.22), in: Capsule())
+                                                    .foregroundStyle(.blue)
+                                            }
                                             Text("\(item.duration_sec)s")
                                                 .font(.system(size: 10.5, design: .monospaced))
                                                 .foregroundStyle(.secondary)
@@ -703,6 +739,36 @@ struct PopoverView: View {
 
                             if isExp {
                                 Divider().opacity(0.25)
+                                if let tests = item.test_checklist, !tests.isEmpty {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("🧪 待测试功能清单")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundStyle(.green)
+                                            Spacer()
+                                            Button("复制清单") {
+                                                let txt = tests.map { "- [ ] \($0)" }.joined(separator: "\n")
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(txt, forType: .string)
+                                                store.showToast("已复制待测试清单")
+                                            }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.mini)
+                                        }
+                                        ForEach(Array(tests.enumerated()), id: \.offset) { _, t in
+                                            Text("• \(t)")
+                                                .font(.system(size: 11))
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                    }
+                                    .padding(8)
+                                    .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                                }
+                                if let note = item.fix_note, !note.isEmpty {
+                                    Text("🔧 \(note)")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.blue)
+                                }
                                 ScrollView {
                                     Text(item.body)
                                         .font(.system(size: 11, design: .monospaced))

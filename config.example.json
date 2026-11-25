@@ -7,6 +7,10 @@
   },
   "auto_review": true,
   "comment_trigger": true,
+  "auto_fix": true,
+  "auto_merge": true,
+  "fallback_fixer": "codex",
+  "max_fix_rounds": 2,
   "skip_draft": true,
   "ignore_branch_prefixes": [
     "dependabot/",
@@ -14,6 +18,7 @@
   ],
   "reasoning_effort": "high",
   "timeout_seconds": 900,
+  "fix_timeout_seconds": 900,
   "max_diff_chars": 120000,
   "port": 18787,
   "poll_interval_seconds": 120,
