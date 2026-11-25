@@ -1865,6 +1865,96 @@ func main() {
 		}
 		writeJSON(w, code, map[string]any{"ok": ok, "message": msg})
 	})
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cfg := bot.reloadConfig()
+			writeJSON(w, 200, map[string]any{
+				"repos":                 cfg.Repos,
+				"local_repo_map":        cfg.LocalRepoMap,
+				"auto_review":           boolDefault(cfg.AutoReview, true),
+				"comment_trigger":       boolDefault(cfg.CommentTrigger, true),
+				"auto_fix":              boolDefault(cfg.AutoFix, true),
+				"auto_merge":            boolDefault(cfg.AutoMerge, true),
+				"fallback_new_session":  boolDefault(cfg.FallbackNewSession, false),
+				"skip_draft":            boolDefault(cfg.SkipDraft, true),
+				"fallback_fixer":        cfg.FallbackFixer,
+				"max_fix_rounds":        intDefault(cfg.MaxFixRounds, 2),
+				"reasoning_effort":      cfg.ReasoningEffort,
+				"poll_interval_seconds": intDefault(cfg.PollIntervalSeconds, 120),
+				"concurrency":           intDefault(cfg.Concurrency, 3),
+				"config_path":           bot.configPath,
+			})
+		case http.MethodPost:
+			var patch struct {
+				Repos               *[]string          `json:"repos"`
+				LocalRepoMap        *map[string]string `json:"local_repo_map"`
+				AutoReview          *bool              `json:"auto_review"`
+				CommentTrigger      *bool              `json:"comment_trigger"`
+				AutoFix             *bool              `json:"auto_fix"`
+				AutoMerge           *bool              `json:"auto_merge"`
+				FallbackNewSession  *bool              `json:"fallback_new_session"`
+				SkipDraft           *bool              `json:"skip_draft"`
+				FallbackFixer       *string            `json:"fallback_fixer"`
+				MaxFixRounds        *int               `json:"max_fix_rounds"`
+				ReasoningEffort     *string            `json:"reasoning_effort"`
+				PollIntervalSeconds *int               `json:"poll_interval_seconds"`
+				Concurrency         *int               `json:"concurrency"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				writeJSON(w, 400, map[string]any{"ok": false, "message": "JSON 解析失败"})
+				return
+			}
+			cfg := bot.reloadConfig()
+			if patch.Repos != nil {
+				cfg.Repos = *patch.Repos
+			}
+			if patch.LocalRepoMap != nil {
+				cfg.LocalRepoMap = *patch.LocalRepoMap
+			}
+			if patch.AutoReview != nil {
+				cfg.AutoReview = patch.AutoReview
+			}
+			if patch.CommentTrigger != nil {
+				cfg.CommentTrigger = patch.CommentTrigger
+			}
+			if patch.AutoFix != nil {
+				cfg.AutoFix = patch.AutoFix
+			}
+			if patch.AutoMerge != nil {
+				cfg.AutoMerge = patch.AutoMerge
+			}
+			if patch.FallbackNewSession != nil {
+				cfg.FallbackNewSession = patch.FallbackNewSession
+			}
+			if patch.SkipDraft != nil {
+				cfg.SkipDraft = patch.SkipDraft
+			}
+			if patch.FallbackFixer != nil {
+				cfg.FallbackFixer = strings.TrimSpace(*patch.FallbackFixer)
+			}
+			if patch.MaxFixRounds != nil && *patch.MaxFixRounds > 0 {
+				cfg.MaxFixRounds = *patch.MaxFixRounds
+			}
+			if patch.ReasoningEffort != nil {
+				cfg.ReasoningEffort = strings.TrimSpace(*patch.ReasoningEffort)
+			}
+			if patch.PollIntervalSeconds != nil && *patch.PollIntervalSeconds >= 15 {
+				cfg.PollIntervalSeconds = *patch.PollIntervalSeconds
+			}
+			if patch.Concurrency != nil && *patch.Concurrency >= 1 && *patch.Concurrency <= 8 {
+				cfg.Concurrency = *patch.Concurrency
+			}
+			bot.mu.Lock()
+			bot.cfg = cfg
+			writeJSONAtomic(bot.configPath, cfg)
+			bot.mu.Unlock()
+			bot.log("⚙️ 已保存新设置（实时生效）")
+			writeJSON(w, 200, map[string]any{"ok": true, "message": "设置已保存"})
+		default:
+			writeJSON(w, 405, map[string]any{"ok": false})
+		}
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "codex-pr-botd-go"})
 	})

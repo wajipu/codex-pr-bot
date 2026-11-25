@@ -160,6 +160,23 @@ struct GitHubRelease: Codable, Sendable {
     let html_url: String
 }
 
+struct BotConfigPayload: Codable, Equatable, Sendable {
+    var repos: [String]
+    var local_repo_map: [String: String]?
+    var auto_review: Bool
+    var comment_trigger: Bool
+    var auto_fix: Bool
+    var auto_merge: Bool
+    var fallback_new_session: Bool
+    var skip_draft: Bool
+    var fallback_fixer: String
+    var max_fix_rounds: Int
+    var reasoning_effort: String
+    var poll_interval_seconds: Int
+    var concurrency: Int
+    var config_path: String?
+}
+
 enum PopoverTab: String, CaseIterable, Identifiable {
     case prs = "Open PR"
     case running = "链路"
@@ -412,6 +429,37 @@ final class BotStore: ObservableObject {
         }
     }
 
+    func fetchConfig() async -> BotConfigPayload? {
+        let session = self.localSession
+        let url = self.baseURL.appendingPathComponent("api/config")
+        return await Task.detached(priority: .userInitiated) {
+            guard let (data, resp) = try? await session.data(from: url),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            return try? JSONDecoder().decode(BotConfigPayload.self, from: data)
+        }.value
+    }
+
+    func saveConfig(_ cfg: BotConfigPayload) async -> Bool {
+        var req = URLRequest(url: baseURL.appendingPathComponent("api/config"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONEncoder().encode(cfg)
+        do {
+            let (_, resp) = try await localSession.data(for: req)
+            let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+            if ok {
+                showToast("设置已保存并生效")
+                refreshNow()
+            } else {
+                showToast("保存设置失败")
+            }
+            return ok
+        } catch {
+            showToast("保存设置失败")
+            return false
+        }
+    }
+
     @discardableResult
     private func post(path: String, body: [String: Any]) async -> Bool {
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
@@ -462,6 +510,7 @@ struct PopoverView: View {
     @State private var fixSessionID = ""
     @State private var fixNote = ""
     @State private var showClosedHistory = false
+    @State private var showSettings = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -587,6 +636,11 @@ struct PopoverView: View {
             .padding(18)
             .frame(width: 396)
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheetView(store: store) {
+                showSettings = false
+            }
+        }
     }
 
     private var topHeader: some View {
@@ -647,6 +701,16 @@ struct PopoverView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help(store.paused ? "恢复轮询" : "暂停轮询")
+            .disabled(!store.connected)
+
+            Button { showSettings = true } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("设置")
             .disabled(!store.connected)
         }
         .padding(.horizontal, 14)
@@ -1319,6 +1383,212 @@ struct PopoverView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+    }
+}
+
+// MARK: - Settings Sheet (live edit config.json without touching code)
+
+struct SettingsSheetView: View {
+    @ObservedObject var store: BotStore
+    let onClose: () -> Void
+
+    @State private var cfg: BotConfigPayload?
+    @State private var newRepo = ""
+    @State private var newRepoPath = ""
+    @State private var saving = false
+
+    private let efforts = ["low", "medium", "high", "max"]
+    private let fixers = ["codex", "claude", "agy", "pi", "opencode"]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Label("设置", systemImage: "gearshape.fill")
+                    .font(.system(size: 14.5, weight: .bold))
+                Spacer()
+                if let p = cfg?.config_path {
+                    Button("打开配置文件") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: p))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            Divider().opacity(0.25)
+
+            if let c = Binding($cfg) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        // Toggles
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("自动化开关")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Toggle("新 PR / 新提交自动审查", isOn: c.auto_review)
+                            Toggle("PR 评论 @codex review 触发", isOn: c.comment_trigger)
+                            Toggle("审查不通过时自动派回原会话修复", isOn: c.auto_fix)
+                            Toggle("原会话不可恢复时允许新开会话", isOn: c.fallback_new_session)
+                            Toggle("审查通过自动合并 PR", isOn: c.auto_merge)
+                            Toggle("跳过草稿 PR (Draft)", isOn: c.skip_draft)
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .font(.system(size: 12.5))
+
+                        Divider().opacity(0.25)
+
+                        // Parameters
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("执行参数")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
+
+                            HStack {
+                                Text("推理深度").font(.system(size: 12))
+                                Spacer()
+                                HStack(spacing: 4) {
+                                    ForEach(efforts, id: \.self) { ef in
+                                        let sel = (c.reasoning_effort.wrappedValue.isEmpty ? "high" : c.reasoning_effort.wrappedValue) == ef
+                                        Button(ef) { c.reasoning_effort.wrappedValue = ef }
+                                            .buttonStyle(.plain)
+                                            .font(.system(size: 11, weight: sel ? .semibold : .regular))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(sel ? Color.accentColor : Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                            .foregroundStyle(sel ? .white : .primary)
+                                    }
+                                }
+                            }
+
+                            HStack {
+                                Text("默认 Agent").font(.system(size: 12))
+                                Spacer()
+                                HStack(spacing: 4) {
+                                    ForEach(fixers, id: \.self) { ag in
+                                        let sel = (c.fallback_fixer.wrappedValue.isEmpty ? "codex" : c.fallback_fixer.wrappedValue) == ag
+                                        Button(ag) { c.fallback_fixer.wrappedValue = ag }
+                                            .buttonStyle(.plain)
+                                            .font(.system(size: 11, weight: sel ? .semibold : .regular))
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 4)
+                                            .background(sel ? Color.accentColor : Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                            .foregroundStyle(sel ? .white : .primary)
+                                    }
+                                }
+                            }
+
+                            HStack {
+                                Text("最大自动修复轮数").font(.system(size: 12))
+                                Spacer()
+                                Stepper("\(c.max_fix_rounds.wrappedValue) 轮", value: c.max_fix_rounds, in: 1...5)
+                                    .font(.system(size: 12, design: .monospaced))
+                            }
+
+                            HStack {
+                                Text("轮询间隔").font(.system(size: 12))
+                                Spacer()
+                                Stepper("\(c.poll_interval_seconds.wrappedValue) 秒", value: c.poll_interval_seconds, in: 30...600, step: 30)
+                                    .font(.system(size: 12, design: .monospaced))
+                            }
+
+                            HStack {
+                                Text("并发上限（重启生效）").font(.system(size: 12))
+                                Spacer()
+                                Stepper("\(c.concurrency.wrappedValue) 个", value: c.concurrency, in: 1...5)
+                                    .font(.system(size: 12, design: .monospaced))
+                            }
+                        }
+
+                        Divider().opacity(0.25)
+
+                        // Repos
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("监听仓库 (\(c.repos.wrappedValue.count))")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
+
+                            ForEach(c.repos.wrappedValue, id: \.self) { r in
+                                HStack {
+                                    Text(r)
+                                        .font(.system(size: 11.5, design: .monospaced))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Button {
+                                        c.repos.wrappedValue.removeAll { $0 == r }
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.red.opacity(0.8))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+                            }
+
+                            HStack(spacing: 6) {
+                                TextField("owner/repo", text: $newRepo)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11.5))
+                                TextField("可选：本地路径", text: $newRepoPath)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11.5))
+                                Button("添加") {
+                                    let r = newRepo.trimmingCharacters(in: .whitespaces)
+                                    guard !r.isEmpty, r.contains("/") else { return }
+                                    if !c.repos.wrappedValue.contains(r) {
+                                        c.repos.wrappedValue.append(r)
+                                    }
+                                    let p = newRepoPath.trimmingCharacters(in: .whitespaces)
+                                    if !p.isEmpty {
+                                        var map = c.local_repo_map.wrappedValue ?? [:]
+                                        map[r] = p
+                                        c.local_repo_map.wrappedValue = map
+                                    }
+                                    newRepo = ""
+                                    newRepoPath = ""
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    }
+                    .padding(16)
+                }
+            } else {
+                ProgressView("加载配置中...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            Divider().opacity(0.25)
+
+            HStack {
+                Spacer()
+                Button("取消", action: onClose)
+                Button(saving ? "保存中..." : "保存设置") {
+                    guard let current = cfg else { return }
+                    saving = true
+                    Task {
+                        _ = await store.saveConfig(current)
+                        saving = false
+                        onClose()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(cfg == nil || saving)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+        .frame(width: 400, height: 520)
+        .task {
+            cfg = await store.fetchConfig()
+        }
     }
 }
 
