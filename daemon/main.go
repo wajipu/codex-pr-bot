@@ -792,6 +792,177 @@ func (b *Bot) triggerManualPR(repo string, number int, note, sessionSpec string)
 	return true, "已加入审查队列"
 }
 
+func (b *Bot) triggerManualFix(repo string, number int, reviewBody, agent, sessionID, note string) (bool, string) {
+	cfg := b.reloadConfig()
+	gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	stdout, stderr, err := runCmd(ctx, "", "", gh, "pr", "view", strconv.Itoa(number), "--repo", repo,
+		"--json", "number,title,url,body,headRefName,headRefOid,baseRefName,isDraft,comments")
+	if err != nil {
+		return false, "gh pr view 失败: " + truncate(strings.TrimSpace(stderr), 160)
+	}
+	var pr GHPR
+	if err := json.Unmarshal([]byte(stdout), &pr); err != nil {
+		return false, "解析 PR 失败"
+	}
+
+	ag := strings.ToLower(strings.TrimSpace(agent))
+	sid := strings.TrimSpace(sessionID)
+	if ag != "" && sid != "" {
+		b.bindSession(repo, number, ag, sid)
+	} else if ag == "" || sid == "" {
+		b.mu.Lock()
+		parsedAg, parsedSid := parseAgentSession(pr, b.state.SessionBindings, repo)
+		b.mu.Unlock()
+		if ag == "" {
+			ag = parsedAg
+		}
+		if sid == "" && ag == parsedAg {
+			sid = parsedSid
+		}
+	}
+	if ag == "" {
+		ag = strings.ToLower(cfg.FallbackFixer)
+		if ag == "" {
+			ag = "codex"
+		}
+	}
+
+	fullFeedback := reviewBody
+	if strings.TrimSpace(note) != "" {
+		fullFeedback = "【附加要求】" + strings.TrimSpace(note) + "\n\n" + reviewBody
+	}
+
+	short := shortRepoName(repo)
+	sha8 := shaPrefix(pr.HeadRefOid)
+	taskKey := fmt.Sprintf("fix|%s#%d:%d", repo, number, time.Now().UnixMilli())
+	started := time.Now()
+	sessLabel := ag
+	if sid != "" {
+		sessLabel = ag + ":" + sid
+	}
+	sessPtr := &sessLabel
+
+	go func() {
+		b.mu.Lock()
+		b.activeTasks[taskKey] = &ActiveTask{
+			ID:           taskKey,
+			WorkerID:     0,
+			Repo:         repo,
+			ShortRepo:    short,
+			Number:       pr.Number,
+			Title:        pr.Title,
+			URL:          pr.URL,
+			Sha8:         sha8,
+			SourceKind:   "manual",
+			TriggerInfo:  fmt.Sprintf("手动发送给 %s 修复", ag),
+			AgentSession: sessPtr,
+			StartedAt:    nowISO(),
+			StartedTS:    float64(started.UnixNano()) / 1e9,
+			Stage:        fmt.Sprintf("派发给 %s 修复...", ag),
+			LiveLines:    []string{},
+			Steps: []PipelineStep{
+				{Name: "发送建议", Status: "done", Detail: ag, At: time.Now().Format("15:04:05")},
+				{Name: ag + " 修复", Status: "running", Detail: "准备 worktree...", At: time.Now().Format("15:04:05")},
+			},
+		}
+		b.mu.Unlock()
+
+		setStage := func(st string) {
+			b.mu.Lock()
+			if cur, ok := b.activeTasks[taskKey]; ok {
+				cur.Stage = st
+				if len(cur.Steps) > 0 {
+					cur.Steps[len(cur.Steps)-1].Detail = st
+				}
+			}
+			b.mu.Unlock()
+		}
+		appendLive := func(line string) {
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				return
+			}
+			b.mu.Lock()
+			if cur, ok := b.activeTasks[taskKey]; ok {
+				cur.LiveLines = append(cur.LiveLines, truncate(line, 300))
+				if len(cur.LiveLines) > 40 {
+					cur.LiveLines = cur.LiveLines[len(cur.LiveLines)-40:]
+				}
+			}
+			b.mu.Unlock()
+		}
+
+		b.log(fmt.Sprintf("🚀 手动发送审查建议给 %s 修复 %s#%d", sessLabel, short, pr.Number))
+		ok, msg := b.runAutoFix(cfg, repo, pr, fullFeedback, ag, sid, setStage, appendLive)
+		dur := int(time.Since(started).Seconds())
+
+		b.mu.Lock()
+		var steps []PipelineStep
+		if cur, exists := b.activeTasks[taskKey]; exists {
+			if len(cur.Steps) > 0 {
+				last := &cur.Steps[len(cur.Steps)-1]
+				if ok {
+					last.Status = "done"
+				} else {
+					last.Status = "failed"
+				}
+				last.Detail = msg
+				last.DurationSec = dur
+			}
+			steps = append([]PipelineStep(nil), cur.Steps...)
+			delete(b.activeTasks, taskKey)
+		}
+		outcome := "failed"
+		if ok {
+			outcome = "fixed"
+		}
+		rec := HistoryItem{
+			ID:            fmt.Sprintf("%d-fix", time.Now().UnixMilli()),
+			FinishedAt:    nowISO(),
+			DurationSec:   dur,
+			OK:            ok,
+			Verdict:       "FIX",
+			Outcome:       outcome,
+			SourceKind:    "manual",
+			FixerAgent:    ag,
+			FixDispatched: ok,
+			FixNote:       msg,
+			Steps:         steps,
+			Repo:          repo,
+			ShortRepo:     short,
+			Number:        pr.Number,
+			Title:         pr.Title,
+			URL:           pr.URL,
+			Sha8:          sha8,
+			TriggerInfo:   fmt.Sprintf("手动发送给 %s 修复", ag),
+			Summary:       msg,
+			Body:          msg + "\n\n---\n" + fullFeedback,
+		}
+		b.history = append([]HistoryItem{rec}, b.history...)
+		if len(b.history) > 50 {
+			b.history = b.history[:50]
+		}
+		writeJSONAtomic(b.historyPath, b.history)
+		b.mu.Unlock()
+
+		if ok {
+			b.log(fmt.Sprintf("✅ %s 修复完成 %s#%d（%ds），触发自动重审", ag, short, pr.Number, dur))
+			notifyMac("🔧 Agent 修复完成 · 即将重审", fmt.Sprintf("%s#%d · %s", short, pr.Number, ag), msg, "Glass")
+			select {
+			case b.wakeScan <- struct{}{}:
+			default:
+			}
+		} else {
+			b.log(fmt.Sprintf("❌ %s 修复失败 %s#%d: %s", ag, short, pr.Number, msg))
+			notifyMac("❌ Agent 修复失败", fmt.Sprintf("%s#%d · %s", short, pr.Number, ag), msg, "Basso")
+		}
+	}()
+
+	return true, fmt.Sprintf("已发送给 %s 修复", ag)
+}
+
 func (b *Bot) runStreamingCmd(ctx context.Context, cwd, stdinText string, appendLive func(string), name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	if cwd != "" {
@@ -1535,6 +1706,31 @@ func main() {
 			return
 		}
 		ok, msg := bot.triggerManualPR(strings.TrimSpace(req.Repo), req.Number, req.Note, req.AgentSession)
+		code := 200
+		if !ok {
+			code = 500
+		}
+		writeJSON(w, code, map[string]any{"ok": ok, "message": msg})
+	})
+	mux.HandleFunc("/api/fix", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"ok": false})
+			return
+		}
+		var req struct {
+			Repo       string `json:"repo"`
+			Number     int    `json:"number"`
+			ReviewBody string `json:"review_body"`
+			Agent      string `json:"agent"`
+			SessionID  string `json:"session_id"`
+			Note       string `json:"note"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Repo == "" || req.Number <= 0 {
+			writeJSON(w, 400, map[string]any{"ok": false, "message": "缺少 repo 或 number"})
+			return
+		}
+		ok, msg := bot.triggerManualFix(strings.TrimSpace(req.Repo), req.Number, req.ReviewBody, req.Agent, req.SessionID, req.Note)
 		code := 200
 		if !ok {
 			code = 500

@@ -289,6 +289,21 @@ final class BotStore: ObservableObject {
         }
     }
 
+    func sendToAgentFix(repo: String, number: Int, reviewBody: String, agent: String, sessionID: String, note: String) {
+        Task {
+            let ok = await post(path: "api/fix", body: [
+                "repo": repo,
+                "number": number,
+                "review_body": reviewBody,
+                "agent": agent,
+                "session_id": sessionID,
+                "note": note
+            ])
+            showToast(ok ? "已发送给 \(agent) 修复：\(repo.split(separator: "/").last ?? "")#\(number)" : "发送修复失败")
+            refreshNow()
+        }
+    }
+
     @discardableResult
     private func post(path: String, body: [String: Any]) async -> Bool {
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
@@ -333,6 +348,11 @@ struct PopoverView: View {
     @State private var notePR: OpenPR?
     @State private var noteText = ""
     @State private var sessionText = ""
+
+    @State private var fixTarget: HistoryItem?
+    @State private var fixAgent = "codex"
+    @State private var fixSessionID = ""
+    @State private var fixNote = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -389,6 +409,51 @@ struct PopoverView: View {
             }
             .padding(18)
             .frame(width: 380)
+        }
+        .sheet(item: $fixTarget) { item in
+            VStack(alignment: .leading, spacing: 12) {
+                Text("发送 Review 建议给 Agent 修复")
+                    .font(.system(size: 14, weight: .bold))
+                Text("\(item.displayRepo)#\(item.number) — \(item.title)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+
+                Picker("目标 Agent", selection: $fixAgent) {
+                    Text("Codex").tag("codex")
+                    Text("Claude Code").tag("claude")
+                    Text("Antigravity (agy)").tag("agy")
+                    Text("Pi").tag("pi")
+                    Text("OpenCode").tag("opencode")
+                }
+                .pickerStyle(.segmented)
+
+                TextField("可选：会话 ID（留空则新开会话修复）", text: $fixSessionID)
+                    .textFieldStyle(.roundedBorder)
+                TextField("可选：附加指令（如：只修 P1 问题）", text: $fixNote)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Spacer()
+                    Button("取消") { fixTarget = nil }
+                    Button("发送给 \(fixAgent)") {
+                        store.sendToAgentFix(
+                            repo: item.repo,
+                            number: item.number,
+                            reviewBody: item.body,
+                            agent: fixAgent,
+                            sessionID: fixSessionID,
+                            note: fixNote
+                        )
+                        fixTarget = nil
+                        tab = .running
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(18)
+            .frame(width: 400)
         }
     }
 
@@ -927,7 +992,7 @@ struct PopoverView: View {
                                 .padding(8)
                                 .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
 
-                                HStack {
+                                HStack(spacing: 8) {
                                     Text(item.finished_at.replacingOccurrences(of: "T", with: " "))
                                         .font(.system(size: 10.5))
                                         .foregroundStyle(.secondary)
@@ -941,6 +1006,24 @@ struct PopoverView: View {
                                         store.showToast("已复制")
                                     }
                                     .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+
+                                    Button("发送给 Agent") {
+                                        // Pre-fill bound agent/session if present on this open PR
+                                        if let open = store.openPRs.first(where: { $0.repo == item.repo && $0.number == item.number }),
+                                           let sess = open.agent_session,
+                                           sess.contains(":") {
+                                            let parts = sess.split(separator: ":", maxSplits: 1)
+                                            fixAgent = String(parts[0])
+                                            fixSessionID = String(parts[1])
+                                        } else {
+                                            fixAgent = item.fixer_agent ?? "codex"
+                                            fixSessionID = ""
+                                        }
+                                        fixNote = ""
+                                        fixTarget = item
+                                    }
+                                    .buttonStyle(.borderedProminent)
                                     .controlSize(.mini)
                                 }
                             }
