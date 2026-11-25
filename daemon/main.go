@@ -1226,7 +1226,21 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 	err = b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...)
 	if err != nil && sessID != "" && ctxFix.Err() != context.DeadlineExceeded {
 		joined := strings.ToLower(strings.Join(tailLines, " "))
-		if strings.Contains(joined, "not found") || strings.Contains(joined, "not_found") || strings.Contains(joined, "no session") || strings.Contains(joined, "unknown session") || strings.Contains(joined, "trajectory") {
+		if useAgent == "codex" && (strings.Contains(joined, "thread-store conflict") || strings.Contains(joined, "conflict")) {
+			b.log(fmt.Sprintf("⚠️ Codex 会话 %s 正被桌面端占用，自动改用 codex exec fork 继承上下文修复", shaPrefix(sessID)))
+			tailLines = nil
+			effort := strings.TrimSpace(cfg.ReasoningEffort)
+			if effort == "" {
+				effort = "medium"
+			}
+			forkArgs := []string{"exec", "fork", sessID, "--skip-git-repo-check",
+				"-c", `sandbox_mode="danger-full-access"`,
+				"-c", `approval_policy="never"`,
+				"-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort),
+				"-"}
+			setStage(fmt.Sprintf("原会话被占用，已 fork (%s) 继承上下文修复中...", shaPrefix(sessID)))
+			err = b.runStreamingCmd(ctxFix, wtPath, fixPrompt, captureLive, binName, forkArgs...)
+		} else if strings.Contains(joined, "not found") || strings.Contains(joined, "not_found") || strings.Contains(joined, "no session") || strings.Contains(joined, "unknown session") || strings.Contains(joined, "trajectory") {
 			if boolDefault(cfg.FallbackNewSession, false) {
 				b.log(fmt.Sprintf("⚠️ %s 原会话 %s 不可恢复，自动降级为新 %s 会话修复", useAgent, shaPrefix(sessID), useAgent))
 				tailLines = nil
