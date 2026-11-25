@@ -1214,24 +1214,25 @@ struct PopoverView: View {
                                     .padding(8)
                                     .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
 
-                                    HStack(spacing: 8) {
-                                        Text(item.finished_at.replacingOccurrences(of: "T", with: " "))
-                                            .font(.system(size: 10.5))
+                                    HStack(spacing: 6) {
+                                        Text(String(item.finished_at.suffix(8)))
+                                            .font(.system(size: 10.5, design: .monospaced))
                                             .foregroundStyle(.secondary)
                                         Spacer()
                                         if let u = URL(string: item.url) {
-                                            Link("GitHub", destination: u).font(.system(size: 11.5))
+                                            Link("GitHub", destination: u).font(.system(size: 11))
                                         }
-                                        Button("复制") {
+                                        Button("复制修复指令") {
+                                            let prompt = "请按以下 Codex PR Review 建议修复 PR \(item.repo)#\(item.number)（\(item.title)），修复后运行必要测试并 push 到该 PR 分支：\n\n\(item.body)"
                                             NSPasteboard.general.clearContents()
-                                            NSPasteboard.general.setString(item.body, forType: .string)
-                                            store.showToast("已复制")
+                                            NSPasteboard.general.setString(prompt, forType: .string)
+                                            store.showToast("已复制修复指令，可直接粘贴给原 Agent 会话")
                                         }
                                         .buttonStyle(.bordered)
                                         .controlSize(.mini)
 
                                         if openNow {
-                                            Button("发送给 Agent") {
+                                            Button("发给 Agent") {
                                                 if let open = store.openPRs.first(where: { $0.repo == item.repo && $0.number == item.number }),
                                                    let sess = open.agent_session,
                                                    sess.contains(":") {

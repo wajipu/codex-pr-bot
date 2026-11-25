@@ -49,6 +49,7 @@ type Config struct {
 	CommentTrigger       *bool                      `json:"comment_trigger"`
 	AutoFix              *bool                      `json:"auto_fix"`
 	AutoMerge            *bool                      `json:"auto_merge"`
+	FallbackNewSession   *bool                      `json:"fallback_new_session"`
 	SkipDraft            *bool                      `json:"skip_draft"`
 	FallbackFixer        string                     `json:"fallback_fixer"`
 	MaxFixRounds         int                        `json:"max_fix_rounds"`
@@ -1214,12 +1215,16 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 	if err != nil && sessID != "" && ctxFix.Err() != context.DeadlineExceeded {
 		joined := strings.ToLower(strings.Join(tailLines, " "))
 		if strings.Contains(joined, "not found") || strings.Contains(joined, "not_found") || strings.Contains(joined, "no session") || strings.Contains(joined, "unknown session") || strings.Contains(joined, "trajectory") {
-			b.log(fmt.Sprintf("⚠️ %s 原会话 %s 不可恢复，自动降级为新 %s 会话修复", useAgent, shaPrefix(sessID), useAgent))
-			tailLines = nil
-			sessID = ""
-			binName, args, stdinText, stageMsg = buildAgentCmd("")
-			setStage("原会话不可用，已自动改用新 " + useAgent + " 会话修复中...")
-			err = b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...)
+			if boolDefault(cfg.FallbackNewSession, false) {
+				b.log(fmt.Sprintf("⚠️ %s 原会话 %s 不可恢复，自动降级为新 %s 会话修复", useAgent, shaPrefix(sessID), useAgent))
+				tailLines = nil
+				sessID = ""
+				binName, args, stdinText, stageMsg = buildAgentCmd("")
+				setStage("原会话不可用，已自动改用新 " + useAgent + " 会话修复中...")
+				err = b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...)
+			} else {
+				return false, fmt.Sprintf("原会话 %s:%s 无法从命令行恢复（已按配置不新开会话，请点「复制修复指令」粘贴给原会话）", useAgent, shaPrefix(sessID))
+			}
 		}
 	}
 
@@ -1468,42 +1473,47 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 				b.log(fmt.Sprintf("[Worker #%d] ⚠️ %s#%d %s", workerID, short, pr.Number, mergeNote))
 			}
 		} else if verdict == "CHANGES_REQUESTED" && boolDefault(cfg.AutoFix, true) {
-			maxRounds := intDefault(cfg.MaxFixRounds, 2)
-			b.mu.Lock()
-			used := b.state.FixRounds[prKey]
-			b.mu.Unlock()
-			if used < maxRounds {
+			if sid == "" && !boolDefault(cfg.FallbackNewSession, false) {
+				fixNote = "未绑定可恢复的 CLI 会话（已按配置不新开会话，可点「复制修复指令」自行粘贴修复）"
+				b.log(fmt.Sprintf("[Worker #%d] ⏸ %s#%d %s", workerID, short, pr.Number, fixNote))
+			} else {
+				maxRounds := intDefault(cfg.MaxFixRounds, 2)
 				b.mu.Lock()
-				b.state.FixRounds[prKey] = used + 1
-				writeJSONAtomic(b.statePath, b.state)
+				used := b.state.FixRounds[prKey]
 				b.mu.Unlock()
+				if used < maxRounds {
+					b.mu.Lock()
+					b.state.FixRounds[prKey] = used + 1
+					writeJSONAtomic(b.statePath, b.state)
+					b.mu.Unlock()
 
-				fixerAgent = ag
-				if fixerAgent == "" {
-					fixerAgent = strings.ToLower(cfg.FallbackFixer)
+					fixerAgent = ag
 					if fixerAgent == "" {
-						fixerAgent = "codex"
+						fixerAgent = strings.ToLower(cfg.FallbackFixer)
+						if fixerAgent == "" {
+							fixerAgent = "codex"
+						}
 					}
-				}
-				startStep("自动派修", fmt.Sprintf("派给 %s 修复（第 %d/%d 轮）...", fixerAgent, used+1, maxRounds))
-				b.log(fmt.Sprintf("[Worker #%d] 🔧 派发自动修复 %s#%d（第 %d/%d 轮）", workerID, short, pr.Number, used+1, maxRounds))
-				fixOK, fNote := b.runAutoFix(cfg, repo, pr, reviewBody, ag, sid, setStage, appendLive)
-				fixDispatched = fixOK
-				fixNote = fNote
-				if fixOK {
-					finishStep("done", fNote)
-					b.log(fmt.Sprintf("[Worker #%d] ✅ %s", workerID, fNote))
-					select {
-					case b.wakeScan <- struct{}{}:
-					default:
+					startStep("自动派修", fmt.Sprintf("派给 %s 修复（第 %d/%d 轮）...", fixerAgent, used+1, maxRounds))
+					b.log(fmt.Sprintf("[Worker #%d] 🔧 派发自动修复 %s#%d（第 %d/%d 轮）", workerID, short, pr.Number, used+1, maxRounds))
+					fixOK, fNote := b.runAutoFix(cfg, repo, pr, reviewBody, ag, sid, setStage, appendLive)
+					fixDispatched = fixOK
+					fixNote = fNote
+					if fixOK {
+						finishStep("done", fNote)
+						b.log(fmt.Sprintf("[Worker #%d] ✅ %s", workerID, fNote))
+						select {
+						case b.wakeScan <- struct{}{}:
+						default:
+						}
+					} else {
+						finishStep("failed", fNote)
+						b.log(fmt.Sprintf("[Worker #%d] ❌ %s", workerID, fNote))
 					}
 				} else {
-					finishStep("failed", fNote)
-					b.log(fmt.Sprintf("[Worker #%d] ❌ %s", workerID, fNote))
+					fixNote = fmt.Sprintf("已达自动修复上限（%d 轮），请人工介入", maxRounds)
+					b.log(fmt.Sprintf("[Worker #%d] ⏹ %s#%d %s", workerID, short, pr.Number, fixNote))
 				}
-			} else {
-				fixNote = fmt.Sprintf("已达自动修复上限（%d 轮），请人工介入", maxRounds)
-				b.log(fmt.Sprintf("[Worker #%d] ⏹ %s#%d %s", workerID, short, pr.Number, fixNote))
 			}
 		}
 	}()

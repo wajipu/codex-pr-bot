@@ -9,6 +9,7 @@
   "comment_trigger": true,
   "auto_fix": true,
   "auto_merge": true,
+  "fallback_new_session": false,
   "fallback_fixer": "codex",
   "max_fix_rounds": 2,
   "skip_draft": true,
