@@ -93,14 +93,20 @@ type TokenUsage struct {
 	InputTokens  int64 `json:"input_tokens"`
 	CachedTokens int64 `json:"cached_tokens"`
 	OutputTokens int64 `json:"output_tokens"`
-	TotalTokens  int64 `json:"total_tokens"`
+	TotalTokens  int64 `json:"total_tokens"` // net uncached tokens: (input - cached) + output
+	GrossTokens  int64 `json:"gross_tokens"` // gross context including cache hits
 }
 
 func (u *TokenUsage) add(other TokenUsage) {
 	u.InputTokens += other.InputTokens
 	u.CachedTokens += other.CachedTokens
 	u.OutputTokens += other.OutputTokens
-	u.TotalTokens = u.InputTokens + u.OutputTokens
+	uncached := u.InputTokens - u.CachedTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	u.TotalTokens = uncached + u.OutputTokens
+	u.GrossTokens = u.InputTokens + u.OutputTokens
 }
 
 type State struct {
@@ -563,9 +569,10 @@ func (b *Bot) buildReviewPrompt(repo string, pr GHPR, diffText, triggerInfo, age
 	}
 	if agentsMD != "" {
 		sb.WriteString("## 仓库 AGENTS.md 规范摘要\n")
-		sb.WriteString(truncate(agentsMD, 6000) + "\n\n")
+		sb.WriteString(truncate(agentsMD, 2500) + "\n\n")
 	}
 	sb.WriteString("## 审查要求\n")
+	sb.WriteString("效率约束：优先直接基于下方 PR Diff 完成审查；除非怀疑存在 P0/P1 缺陷必须核对上下文，否则不要执行多余的 shell 搜索（最多 3 次只读查看），快速给出高信号结论。\n")
 	sb.WriteString("聚焦高信号问题，避免吹毛求疵：\n")
 	sb.WriteString("1. **P0 / P1 缺陷**：逻辑错误、空指针/边界条件、并发/事务/状态机漏洞、数据丢失或越权风险。\n")
 	sb.WriteString("2. **回归与破坏性变更**：接口签名变更、配置/路由破坏、无意删除功能。\n")
@@ -1012,13 +1019,18 @@ func parseCodexJSONLine(line string) (display string, usage *TokenUsage) {
 	switch ev.Type {
 	case "turn.completed":
 		if ev.Usage != nil {
+			uncached := ev.Usage.InputTokens - ev.Usage.CachedInputTokens
+			if uncached < 0 {
+				uncached = 0
+			}
 			u := &TokenUsage{
 				InputTokens:  ev.Usage.InputTokens,
 				CachedTokens: ev.Usage.CachedInputTokens,
 				OutputTokens: ev.Usage.OutputTokens,
-				TotalTokens:  ev.Usage.InputTokens + ev.Usage.OutputTokens,
+				TotalTokens:  uncached + ev.Usage.OutputTokens,
+				GrossTokens:  ev.Usage.InputTokens + ev.Usage.OutputTokens,
 			}
-			return fmt.Sprintf("✓ 本轮完成（input=%d, cached=%d, output=%d）", u.InputTokens, u.CachedTokens, u.OutputTokens), u
+			return fmt.Sprintf("✓ 本轮完成（实际=%d, 缓存=%d, 输出=%d）", u.TotalTokens, u.CachedTokens, u.OutputTokens), u
 		}
 	case "item.completed":
 		if ev.Item != nil {
@@ -1378,7 +1390,7 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		}
 		finishStep("done", fmt.Sprintf("%d 字符", len(diffText)))
 
-		maxDiff := intDefault(cfg.MaxDiffChars, 120000)
+		maxDiff := intDefault(cfg.MaxDiffChars, 60000)
 		if len(diffText) > maxDiff {
 			diffText = diffText[:maxDiff] + fmt.Sprintf("\n... [diff truncated at %d chars]", maxDiff)
 		}
@@ -1398,7 +1410,7 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		defer os.Remove(outPath)
 
 		effort := strings.TrimSpace(cfg.ReasoningEffort)
-		args := []string{"exec", "--json", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
+		args := []string{"exec", "--json", "--ephemeral", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
 		if effort != "" {
 			args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
 		}

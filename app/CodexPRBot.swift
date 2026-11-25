@@ -39,6 +39,11 @@ struct TokenUsage: Codable, Equatable, Sendable {
     let cached_tokens: Int64
     let output_tokens: Int64
     let total_tokens: Int64
+
+    var netTokens: Int64 {
+        let uncached = max(0, input_tokens - cached_tokens)
+        return uncached + output_tokens
+    }
 }
 
 struct BotSnapshot: Codable, Equatable, Sendable {
@@ -912,7 +917,7 @@ struct PopoverView: View {
                     Circle()
                         .fill(isReviewing ? Color.orange : Color.green)
                         .frame(width: 7, height: 7)
-                    Text("今日 \(formatTokens(store.todayUsage?.total_tokens ?? 0)) token · 累计 \(formatTokens(store.totalUsage?.total_tokens ?? 0))")
+                    Text("今日 \(formatTokens(store.todayUsage?.netTokens ?? 0)) token · 累计 \(formatTokens(store.totalUsage?.netTokens ?? 0))")
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -1040,8 +1045,8 @@ struct PopoverView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                                 Spacer()
-                                if let u = item.usage, u.total_tokens > 0 {
-                                    Text("\(formatTokens(u.total_tokens)) token ·")
+                                if let u = item.usage, u.netTokens > 0 {
+                                    Text("\(formatTokens(u.netTokens)) token ·")
                                         .font(.system(size: 10.5, design: .monospaced))
                                         .foregroundStyle(.cyan.opacity(0.9))
                                 }
@@ -1211,8 +1216,8 @@ struct PopoverView: View {
                                                 Text("\(item.duration_sec)s")
                                                     .font(.system(size: 10.5, design: .monospaced))
                                                     .foregroundStyle(.secondary)
-                                                if let u = item.usage, u.total_tokens > 0 {
-                                                    Text("\(formatTokens(u.total_tokens)) tok")
+                                                if let u = item.usage, u.netTokens > 0 {
+                                                    Text("\(formatTokens(u.netTokens)) tok")
                                                         .font(.system(size: 10, design: .monospaced))
                                                         .foregroundStyle(.cyan.opacity(0.9))
                                                 }
@@ -1259,7 +1264,8 @@ struct PopoverView: View {
                                         .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
                                     }
                                     if let u = item.usage, u.total_tokens > 0 {
-                                        Text("Token：共 \(formatTokens(u.total_tokens))（输入 \(formatTokens(u.input_tokens)) · 缓存 \(formatTokens(u.cached_tokens)) · 输出 \(formatTokens(u.output_tokens))）")
+                                        let net = max(0, u.input_tokens - u.cached_tokens) + u.output_tokens
+                                        Text("实际消耗：\(formatTokens(net))（新增输入 \(formatTokens(max(0, u.input_tokens - u.cached_tokens))) · 输出 \(formatTokens(u.output_tokens)) · 缓存命中 \(formatTokens(u.cached_tokens))）")
                                             .font(.system(size: 10.5, design: .monospaced))
                                             .foregroundStyle(.cyan.opacity(0.9))
                                     }
