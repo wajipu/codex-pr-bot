@@ -1125,90 +1125,78 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 	ctxFix, cancelFix := context.WithTimeout(context.Background(), time.Duration(timeoutS)*time.Second)
 	defer cancelFix()
 
-	var binName string
-	var args []string
-	stdinText := ""
-
-	switch useAgent {
-	case "claude":
-		binName = findBin(cfg.ClaudeBin, "claude", []string{"/opt/homebrew/bin/claude", "/usr/local/bin/claude", "~/.local/bin/claude"})
-		if sessID != "" {
-			setStage(fmt.Sprintf("恢复 Claude 会话 (%s) 自动修复中...", shaPrefix(sessID)))
-			args = []string{"--resume", sessID, "-p", fixPrompt, "--permission-mode", "acceptEdits"}
-		} else {
-			setStage("启动新 Claude 会话自动修复中...")
-			args = []string{"-p", fixPrompt, "--permission-mode", "acceptEdits"}
-		}
-	case "agy":
-		binName = findBin(cfg.AgyBin, "agy", []string{"~/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"})
-		if sessID != "" {
-			setStage(fmt.Sprintf("恢复 Antigravity 会话 (%s) 自动修复中...", shaPrefix(sessID)))
-			args = []string{"--resume", sessID, "--mode", "accept-edits", "-p", fixPrompt}
-		} else {
-			setStage("启动新 Antigravity 会话自动修复中...")
-			args = []string{"--mode", "accept-edits", "-p", fixPrompt}
-		}
-	case "pi":
-		binName = findBin(cfg.PiBin, "pi", []string{"/opt/homebrew/bin/pi", "/usr/local/bin/pi", "~/.local/bin/pi"})
-		if sessID != "" {
-			setStage(fmt.Sprintf("恢复 Pi 会话 (%s) 自动修复中...", shaPrefix(sessID)))
-			args = []string{"--session", sessID, "-p", fixPrompt}
-		} else {
-			setStage("启动新 Pi 会话自动修复中...")
-			args = []string{"-p", fixPrompt}
-		}
-	case "opencode":
-		binName = findBin(cfg.OpencodeBin, "opencode", []string{"/opt/homebrew/bin/opencode", "/usr/local/bin/opencode", "~/.local/bin/opencode"})
-		if sessID != "" {
-			setStage(fmt.Sprintf("恢复 OpenCode 会话 (%s) 自动修复中...", shaPrefix(sessID)))
-			args = []string{"run", "--session", sessID, "--auto", fixPrompt}
-		} else {
-			setStage("启动新 OpenCode 会话自动修复中...")
-			args = []string{"run", "--auto", fixPrompt}
-		}
-	default:
-		if spec, ok := cfg.CustomAgents[useAgent]; ok {
-			tpl := spec.Fresh
-			if sessID != "" && len(spec.Resume) > 0 {
-				tpl = spec.Resume
+	buildAgentCmd := func(sid string) (string, []string, string, string) {
+		switch useAgent {
+		case "claude":
+			bin := findBin(cfg.ClaudeBin, "claude", []string{"/opt/homebrew/bin/claude", "/usr/local/bin/claude", "~/.local/bin/claude"})
+			if sid != "" {
+				return bin, []string{"--resume", sid, "-p", fixPrompt, "--permission-mode", "acceptEdits"}, "", fmt.Sprintf("恢复 Claude 会话 (%s) 自动修复中...", shaPrefix(sid))
 			}
-			if len(tpl) == 0 {
-				return false, fmt.Sprintf("custom_agents.%s 未配置命令模板", useAgent)
+			return bin, []string{"-p", fixPrompt, "--permission-mode", "acceptEdits"}, "", "启动新 Claude 会话自动修复中..."
+		case "agy":
+			bin := findBin(cfg.AgyBin, "agy", []string{"~/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"})
+			if sid != "" {
+				return bin, []string{"--resume", sid, "--mode", "accept-edits", "-p", fixPrompt}, "", fmt.Sprintf("恢复 Antigravity 会话 (%s) 自动修复中...", shaPrefix(sid))
 			}
-			setStage(fmt.Sprintf("运行自定义 Agent %s 自动修复中...", useAgent))
-			resolved := make([]string, 0, len(tpl))
-			for _, a := range tpl {
-				a = strings.ReplaceAll(a, "{session_id}", sessID)
-				a = strings.ReplaceAll(a, "{prompt}", fixPrompt)
-				a = strings.ReplaceAll(a, "{cwd}", wtPath)
-				resolved = append(resolved, a)
+			return bin, []string{"--mode", "accept-edits", "-p", fixPrompt}, "", "启动新 Antigravity 会话自动修复中..."
+		case "pi":
+			bin := findBin(cfg.PiBin, "pi", []string{"/opt/homebrew/bin/pi", "/usr/local/bin/pi", "~/.local/bin/pi"})
+			if sid != "" {
+				return bin, []string{"--session", sid, "-p", fixPrompt}, "", fmt.Sprintf("恢复 Pi 会话 (%s) 自动修复中...", shaPrefix(sid))
 			}
-			binName = resolved[0]
-			args = resolved[1:]
-		} else {
-			binName = findBin(cfg.CodexBin, "codex", []string{"/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/Applications/Codex.app/Contents/Resources/codex"})
+			return bin, []string{"-p", fixPrompt}, "", "启动新 Pi 会话自动修复中..."
+		case "opencode":
+			bin := findBin(cfg.OpencodeBin, "opencode", []string{"/opt/homebrew/bin/opencode", "/usr/local/bin/opencode", "~/.local/bin/opencode"})
+			if sid != "" {
+				return bin, []string{"run", "--session", sid, "--auto", fixPrompt}, "", fmt.Sprintf("恢复 OpenCode 会话 (%s) 自动修复中...", shaPrefix(sid))
+			}
+			return bin, []string{"run", "--auto", fixPrompt}, "", "启动新 OpenCode 会话自动修复中..."
+		default:
+			if spec, ok := cfg.CustomAgents[useAgent]; ok {
+				tpl := spec.Fresh
+				if sid != "" && len(spec.Resume) > 0 {
+					tpl = spec.Resume
+				}
+				if len(tpl) == 0 {
+					return "", nil, "", ""
+				}
+				resolved := make([]string, 0, len(tpl))
+				for _, a := range tpl {
+					a = strings.ReplaceAll(a, "{session_id}", sid)
+					a = strings.ReplaceAll(a, "{prompt}", fixPrompt)
+					a = strings.ReplaceAll(a, "{cwd}", wtPath)
+					resolved = append(resolved, a)
+				}
+				return resolved[0], resolved[1:], "", fmt.Sprintf("运行自定义 Agent %s 自动修复中...", useAgent)
+			}
+			bin := findBin(cfg.CodexBin, "codex", []string{"/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/Applications/Codex.app/Contents/Resources/codex"})
 			effort := strings.TrimSpace(cfg.ReasoningEffort)
 			if effort == "" {
 				effort = "high"
 			}
-			stdinText = fixPrompt
-			if sessID != "" {
-				setStage(fmt.Sprintf("恢复 Codex 会话 (%s) 自动修复中...", shaPrefix(sessID)))
-				args = []string{"exec", "resume", sessID, "--skip-git-repo-check",
+			if sid != "" {
+				return bin, []string{"exec", "resume", sid, "--skip-git-repo-check",
 					"-c", `sandbox_mode="danger-full-access"`,
 					"-c", `approval_policy="never"`,
 					"-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort),
-					"-"}
-			} else {
-				setStage("启动新 Codex 会话自动修复中...")
-				args = []string{"exec", "-C", wtPath, "--skip-git-repo-check",
-					"-c", `sandbox_mode="danger-full-access"`,
-					"-c", `approval_policy="never"`,
-					"-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort),
-					"-"}
+					"-"}, fixPrompt, fmt.Sprintf("恢复 Codex 会话 (%s) 自动修复中...", shaPrefix(sid))
 			}
+			return bin, []string{"exec", "-C", wtPath, "--skip-git-repo-check",
+				"-c", `sandbox_mode="danger-full-access"`,
+				"-c", `approval_policy="never"`,
+				"-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort),
+				"-"}, fixPrompt, "启动新 Codex 会话自动修复中..."
 		}
 	}
+
+	if strings.EqualFold(strings.TrimSpace(sessID), "new") {
+		sessID = ""
+	}
+	binName, args, stdinText, stageMsg := buildAgentCmd(sessID)
+	if binName == "" {
+		return false, fmt.Sprintf("custom_agents.%s 未配置命令模板", useAgent)
+	}
+	setStage(stageMsg)
 
 	var tailLines []string
 	captureLive := func(line string) {
@@ -1222,7 +1210,20 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 		}
 	}
 
-	if err := b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...); err != nil {
+	err = b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...)
+	if err != nil && sessID != "" && ctxFix.Err() != context.DeadlineExceeded {
+		joined := strings.ToLower(strings.Join(tailLines, " "))
+		if strings.Contains(joined, "not found") || strings.Contains(joined, "not_found") || strings.Contains(joined, "no session") || strings.Contains(joined, "unknown session") || strings.Contains(joined, "trajectory") {
+			b.log(fmt.Sprintf("⚠️ %s 原会话 %s 不可恢复，自动降级为新 %s 会话修复", useAgent, shaPrefix(sessID), useAgent))
+			tailLines = nil
+			sessID = ""
+			binName, args, stdinText, stageMsg = buildAgentCmd("")
+			setStage("原会话不可用，已自动改用新 " + useAgent + " 会话修复中...")
+			err = b.runStreamingCmd(ctxFix, wtPath, stdinText, captureLive, binName, args...)
+		}
+	}
+
+	if err != nil {
 		if ctxFix.Err() == context.DeadlineExceeded {
 			return false, fmt.Sprintf("自动修复超时（>%ds）", timeoutS)
 		}
