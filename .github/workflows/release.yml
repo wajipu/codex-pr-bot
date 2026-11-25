@@ -1,0 +1,63 @@
+name: Release macOS App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VER="${{ github.event.inputs.version }}"
+            TAG="v${VER#v}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build Codex PR Bot.app
+        run: |
+          chmod +x scripts/build-app.sh
+          ./scripts/build-app.sh "${{ steps.meta.outputs.version }}" dist
+
+      - name: Package ZIP and DMG
+        run: |
+          VER="${{ steps.meta.outputs.version }}"
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent "dist/Codex PR Bot.app" "release/Codex-PR-Bot-v${VER}-macos-arm64.zip"
+          hdiutil create -volname "Codex PR Bot" \
+            -srcfolder "dist/Codex PR Bot.app" \
+            -ov -format UDZO \
+            "release/Codex-PR-Bot-v${VER}-macos-arm64.dmg"
+          (cd release && shasum -a 256 * > SHA256SUMS.txt)
+          ls -lh release/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Codex PR Bot ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release/*.zip
+            release/*.dmg
+            release/SHA256SUMS.txt

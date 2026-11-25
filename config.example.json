@@ -1,0 +1,21 @@
+{
+  "repos": [
+    "your-org/your-repo"
+  ],
+  "local_repo_map": {
+    "your-org/your-repo": "~/code/your-repo"
+  },
+  "auto_review": true,
+  "comment_trigger": true,
+  "skip_draft": true,
+  "ignore_branch_prefixes": [
+    "dependabot/",
+    "renovate/"
+  ],
+  "reasoning_effort": "high",
+  "timeout_seconds": 900,
+  "max_diff_chars": 120000,
+  "port": 18787,
+  "poll_interval_seconds": 120,
+  "concurrency": 3
+}

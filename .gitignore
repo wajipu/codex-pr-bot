@@ -1,0 +1,11 @@
+.DS_Store
+build/
+dist/
+*.dmg
+*.zip
+*.log
+config.json
+state.json
+history.json
+bot.lock
+__pycache__/
