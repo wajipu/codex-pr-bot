@@ -917,6 +917,10 @@ func notifyMac(title, subtitle, message, sound string) {
 	if runtime.GOOS != "darwin" {
 		return
 	}
+	// If the SwiftUI menu bar app is running, it handles notifications — avoid duplicate banners
+	if exec.Command("/usr/bin/pgrep", "-x", "KoKLamPRBot").Run() == nil {
+		return
+	}
 	esc := func(s string) string {
 		s = strings.ReplaceAll(s, `\`, `\\`)
 		s = strings.ReplaceAll(s, `"`, `\"`)

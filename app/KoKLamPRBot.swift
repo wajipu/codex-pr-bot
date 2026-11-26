@@ -534,7 +534,9 @@ final class BotStore: ObservableObject {
         } else if item.fix_dispatched == true {
             NotificationDelegate.shared.send(title: "🔧 已自动派回 Agent 修复", subtitle: sub, body: item.fix_note ?? item.summary)
         } else if item.verdict == "PASS" {
-            NotificationDelegate.shared.send(title: "✅ Codex Review 通过", subtitle: sub, body: item.summary)
+            NotificationDelegate.shared.send(title: "✅ KoKLam PR 评审通过", subtitle: sub, body: item.summary)
+        } else if item.trigger_info.contains("MCP") || (item.fix_note ?? "").contains("MCP") {
+            NotificationDelegate.shared.send(title: "⚠️ PR 建议修改（已返回原会话修复）", subtitle: sub, body: item.summary)
         } else {
             NotificationDelegate.shared.send(title: "⚠️ PR 建议修改后再合并", subtitle: sub, body: item.summary)
         }
