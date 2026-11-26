@@ -59,6 +59,198 @@ func matchCommentTrigger(body string, cfg Config) bool {
 	return false
 }
 
+func appendUniqueModels(dst []string, seen map[string]bool, items ...string) []string {
+	for _, s := range items {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		dst = append(dst, s)
+	}
+	return dst
+}
+
+func discoverCLIModels() map[string][]string {
+	home, _ := os.UserHomeDir()
+	out := map[string][]string{
+		"codex":    {},
+		"claude":   {},
+		"agy":      {},
+		"pi":       {},
+		"opencode": {},
+	}
+
+	// 1. Codex: ~/.codex/config.toml + model_catalog_json
+	{
+		seen := map[string]bool{}
+		var list []string
+		var catalogPath string
+		if raw, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml")); err == nil {
+			kvRe := regexp.MustCompile(`(?m)^\s*(review_model|model|model_catalog_json)\s*=\s*"([^"]+)"`)
+			for _, m := range kvRe.FindAllStringSubmatch(string(raw), -1) {
+				if m[1] == "model_catalog_json" {
+					catalogPath = m[2]
+				} else {
+					list = appendUniqueModels(list, seen, m[2])
+				}
+			}
+		}
+		if catalogPath != "" {
+			if strings.HasPrefix(catalogPath, "~/") {
+				catalogPath = filepath.Join(home, catalogPath[2:])
+			}
+			if raw, err := os.ReadFile(catalogPath); err == nil {
+				var cat struct {
+					Models []struct {
+						Slug string `json:"slug"`
+						ID   string `json:"id"`
+					} `json:"models"`
+				}
+				if json.Unmarshal(raw, &cat) == nil {
+					for _, m := range cat.Models {
+						id := m.Slug
+						if id == "" {
+							id = m.ID
+						}
+						list = appendUniqueModels(list, seen, id)
+					}
+				}
+			}
+		}
+		if len(list) == 0 {
+			list = []string{"gpt-5.4", "gpt-5.3-codex", "o3"}
+		}
+		out["codex"] = list
+	}
+
+	// 2. Claude: ~/.claude/settings.json
+	{
+		seen := map[string]bool{}
+		var list []string
+		if raw, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json")); err == nil {
+			var s struct {
+				Model string            `json:"model"`
+				Env   map[string]string `json:"env"`
+			}
+			if json.Unmarshal(raw, &s) == nil {
+				list = appendUniqueModels(list, seen,
+					s.Model,
+					s.Env["ANTHROPIC_MODEL"],
+					s.Env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+					s.Env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+					s.Env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+					s.Env["ANTHROPIC_SMALL_FAST_MODEL"],
+				)
+				if caps := s.Env["CLAUDE_CODE_MODEL_CAPABILITIES"]; caps != "" {
+					for _, entry := range strings.Split(caps, ";") {
+						name := strings.TrimSpace(strings.SplitN(entry, "=", 2)[0])
+						if name == "" || strings.HasPrefix(name, "mythos-magpie-") {
+							continue
+						}
+						list = appendUniqueModels(list, seen, name)
+					}
+				}
+			}
+		}
+		list = appendUniqueModels(list, seen, "sonnet", "opus", "haiku")
+		out["claude"] = list
+	}
+
+	// 3. Agy: ~/.gemini/antigravity-cli/settings.json
+	{
+		seen := map[string]bool{}
+		var list []string
+		if raw, err := os.ReadFile(filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")); err == nil {
+			var s struct {
+				Model string `json:"model"`
+			}
+			if json.Unmarshal(raw, &s) == nil {
+				list = appendUniqueModels(list, seen, s.Model)
+			}
+		}
+		out["agy"] = list
+	}
+
+	// 4. Pi: ~/.pi/agent/settings.json + ~/.pi/agent/models.json
+	{
+		seen := map[string]bool{}
+		var list []string
+		if raw, err := os.ReadFile(filepath.Join(home, ".pi", "agent", "settings.json")); err == nil {
+			var s struct {
+				DefaultModel    string `json:"defaultModel"`
+				DefaultProvider string `json:"defaultProvider"`
+			}
+			if json.Unmarshal(raw, &s) == nil && s.DefaultModel != "" {
+				if s.DefaultProvider != "" && !strings.Contains(s.DefaultModel, "/") {
+					list = appendUniqueModels(list, seen, s.DefaultProvider+"/"+s.DefaultModel)
+				} else {
+					list = appendUniqueModels(list, seen, s.DefaultModel)
+				}
+			}
+		}
+		if raw, err := os.ReadFile(filepath.Join(home, ".pi", "agent", "models.json")); err == nil {
+			var m struct {
+				Providers map[string]struct {
+					Models []struct {
+						ID string `json:"id"`
+					} `json:"models"`
+				} `json:"providers"`
+			}
+			if json.Unmarshal(raw, &m) == nil {
+				pnames := make([]string, 0, len(m.Providers))
+				for k := range m.Providers {
+					pnames = append(pnames, k)
+				}
+				sort.Strings(pnames)
+				for _, p := range pnames {
+					for _, mod := range m.Providers[p].Models {
+						if mod.ID != "" {
+							list = appendUniqueModels(list, seen, p+"/"+mod.ID)
+						}
+					}
+				}
+			}
+		}
+		out["pi"] = list
+	}
+
+	// 5. OpenCode: ~/.config/opencode/opencode.json
+	{
+		seen := map[string]bool{}
+		var list []string
+		if raw, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "opencode.json")); err == nil {
+			var oc struct {
+				Model    string `json:"model"`
+				Provider map[string]struct {
+					Models map[string]any `json:"models"`
+				} `json:"provider"`
+			}
+			if json.Unmarshal(raw, &oc) == nil {
+				list = appendUniqueModels(list, seen, oc.Model)
+				pnames := make([]string, 0, len(oc.Provider))
+				for k := range oc.Provider {
+					pnames = append(pnames, k)
+				}
+				sort.Strings(pnames)
+				for _, p := range pnames {
+					mnames := make([]string, 0, len(oc.Provider[p].Models))
+					for mk := range oc.Provider[p].Models {
+						mnames = append(mnames, mk)
+					}
+					sort.Strings(mnames)
+					for _, mk := range mnames {
+						list = appendUniqueModels(list, seen, p+"/"+mk)
+					}
+				}
+			}
+		}
+		out["opencode"] = list
+	}
+
+	return out
+}
+
 // MARK: - Config & State
 
 type CustomAgentSpec struct {
@@ -83,6 +275,7 @@ type Config struct {
 	MaxFixRounds         int                        `json:"max_fix_rounds"`
 	IgnoreBranchPrefixes []string                   `json:"ignore_branch_prefixes"`
 	AllowedCommenters    []string                   `json:"allowed_commenters"`
+	ReviewAgent          string                     `json:"review_agent"`
 	ReviewModel          string                     `json:"review_model"`
 	ReasoningEffort      string                     `json:"reasoning_effort"`
 	TimeoutSeconds       int                        `json:"timeout_seconds"`
@@ -1826,48 +2019,104 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		workDir, agentsMD := b.readLocalAgentsMD(cfg, repo)
 		prompt := b.buildReviewPrompt(repo, pr, diffText, job.TriggerInfo, agentsMD)
 
-		startStep("Codex 审查", "运行本机 Codex CLI 审查中...")
-		tmpFile, err := os.CreateTemp("", "codex-review-*.md")
-		if err != nil {
-			errorMsg = "创建临时文件失败"
-			finishStep("failed", errorMsg)
-			return
+		reviewAgent := strings.ToLower(strings.TrimSpace(cfg.ReviewAgent))
+		if reviewAgent == "" {
+			reviewAgent = "codex"
 		}
-		outPath := tmpFile.Name()
-		_ = tmpFile.Close()
-		defer os.Remove(outPath)
-
 		effort := strings.TrimSpace(cfg.ReasoningEffort)
 		model := strings.TrimSpace(cfg.ReviewModel)
-		args := []string{"exec", "--json", "--ephemeral", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
-		if model != "" {
-			args = append(args, "-m", model)
-		}
-		if effort != "" {
-			args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
-		}
-		args = append(args, "-o", outPath, "-")
-
 		timeoutS := intDefault(cfg.TimeoutSeconds, 900)
-		ctxCodex, cancelCodex := context.WithTimeout(context.Background(), time.Duration(timeoutS)*time.Second)
-		runErr := b.runStreamingCmd(ctxCodex, workDir, prompt, func(line string) {
-			disp, u := parseCodexJSONLine(line)
-			if u != nil {
-				totalJobUsage.add(*u)
-			}
-			if disp != "" {
-				appendLive(disp)
-			}
-		}, codex, args...)
-		cancelCodex()
+		ctxRev, cancelRev := context.WithTimeout(context.Background(), time.Duration(timeoutS)*time.Second)
 
-		outBytes, _ := os.ReadFile(outPath)
-		reviewBody = strings.TrimSpace(string(outBytes))
+		var runErr error
+		if reviewAgent == "codex" {
+			startStep("Codex 审查", "运行本机 Codex CLI 审查中...")
+			tmpFile, err := os.CreateTemp("", "codex-review-*.md")
+			if err != nil {
+				cancelRev()
+				errorMsg = "创建临时文件失败"
+				finishStep("failed", errorMsg)
+				return
+			}
+			outPath := tmpFile.Name()
+			_ = tmpFile.Close()
+			defer os.Remove(outPath)
+
+			args := []string{"exec", "--json", "--ephemeral", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
+			if model != "" {
+				args = append(args, "-m", model)
+			}
+			if effort != "" {
+				args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
+			}
+			args = append(args, "-o", outPath, "-")
+
+			runErr = b.runStreamingCmd(ctxRev, workDir, prompt, func(line string) {
+				disp, u := parseCodexJSONLine(line)
+				if u != nil {
+					totalJobUsage.add(*u)
+				}
+				if disp != "" {
+					appendLive(disp)
+				}
+			}, codex, args...)
+			outBytes, _ := os.ReadFile(outPath)
+			reviewBody = strings.TrimSpace(string(outBytes))
+		} else {
+			startStep(strings.ToUpper(reviewAgent)+" 审查", fmt.Sprintf("运行本机 %s CLI 审查中...", reviewAgent))
+			var bin string
+			var args []string
+			switch reviewAgent {
+			case "claude":
+				bin = findBin(cfg.ClaudeBin, "claude", []string{"/opt/homebrew/bin/claude", "/usr/local/bin/claude", "~/.local/bin/claude"})
+				args = []string{"-p", prompt, "--output-format", "text", "--permission-mode", "plan"}
+				if model != "" {
+					args = append(args, "--model", model)
+				}
+			case "agy":
+				bin = findBin(cfg.AgyBin, "agy", []string{"/opt/homebrew/bin/agy", "/usr/local/bin/agy", "~/.local/bin/agy"})
+				args = []string{"-p", prompt, "--output-format", "text", "--mode", "plan"}
+				if model != "" {
+					args = append(args, "--model", model)
+				}
+				if effort != "" {
+					args = append(args, "--effort", effort)
+				}
+			case "pi":
+				bin = findBin(cfg.PiBin, "pi", []string{"/opt/homebrew/bin/pi", "/usr/local/bin/pi", "~/.local/bin/pi"})
+				args = []string{"-p", "--mode", "text"}
+				if model != "" {
+					args = append(args, "--model", model)
+				}
+				args = append(args, prompt)
+			case "opencode":
+				bin = findBin(cfg.OpencodeBin, "opencode", []string{"/opt/homebrew/bin/opencode", "/usr/local/bin/opencode", "~/.local/bin/opencode"})
+				args = []string{"run"}
+				if model != "" {
+					args = append(args, "--model", model)
+				}
+				args = append(args, prompt)
+			default:
+				cancelRev()
+				errorMsg = fmt.Sprintf("不支持的 review_agent: %s", reviewAgent)
+				finishStep("failed", errorMsg)
+				return
+			}
+			var outBuf strings.Builder
+			runErr = b.runStreamingCmd(ctxRev, workDir, "", func(line string) {
+				outBuf.WriteString(line)
+				outBuf.WriteByte('\n')
+				appendLive(line)
+			}, bin, args...)
+			reviewBody = strings.TrimSpace(outBuf.String())
+		}
+		cancelRev()
+
 		if runErr != nil || reviewBody == "" {
-			if ctxCodex.Err() == context.DeadlineExceeded {
-				errorMsg = fmt.Sprintf("codex exec 超时（>%ds）", timeoutS)
+			if ctxRev.Err() == context.DeadlineExceeded {
+				errorMsg = fmt.Sprintf("%s 审查超时（>%ds）", reviewAgent, timeoutS)
 			} else {
-				errorMsg = fmt.Sprintf("codex exec 失败: %v", runErr)
+				errorMsg = fmt.Sprintf("%s 审查失败: %v", reviewAgent, runErr)
 			}
 			finishStep("failed", errorMsg)
 			return
@@ -2479,7 +2728,9 @@ func main() {
 				"github_app_private_key": cfg.GitHubAppPrivateKey,
 				"fallback_fixer":         cfg.FallbackFixer,
 				"max_fix_rounds":        intDefault(cfg.MaxFixRounds, 2),
+				"review_agent":          cfg.ReviewAgent,
 				"review_model":          cfg.ReviewModel,
+				"discovered_models":     discoverCLIModels(),
 				"reasoning_effort":      cfg.ReasoningEffort,
 				"poll_interval_seconds": intDefault(cfg.PollIntervalSeconds, 120),
 				"concurrency":           intDefault(cfg.Concurrency, 3),
@@ -2501,6 +2752,7 @@ func main() {
 				GitHubAppPrivateKey *string            `json:"github_app_private_key"`
 				FallbackFixer       *string            `json:"fallback_fixer"`
 				MaxFixRounds        *int               `json:"max_fix_rounds"`
+				ReviewAgent         *string            `json:"review_agent"`
 				ReviewModel         *string            `json:"review_model"`
 				ReasoningEffort     *string            `json:"reasoning_effort"`
 				PollIntervalSeconds *int               `json:"poll_interval_seconds"`
@@ -2552,6 +2804,9 @@ func main() {
 			}
 			if patch.MaxFixRounds != nil && *patch.MaxFixRounds > 0 {
 				cfg.MaxFixRounds = *patch.MaxFixRounds
+			}
+			if patch.ReviewAgent != nil {
+				cfg.ReviewAgent = strings.TrimSpace(*patch.ReviewAgent)
 			}
 			if patch.ReviewModel != nil {
 				cfg.ReviewModel = strings.TrimSpace(*patch.ReviewModel)

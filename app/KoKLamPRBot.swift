@@ -222,7 +222,9 @@ struct BotConfigPayload: Codable, Equatable, Sendable {
     var github_app_private_key: String?
     var fallback_fixer: String
     var max_fix_rounds: Int
+    var review_agent: String?
     var review_model: String?
+    var discovered_models: [String: [String]]?
     var reasoning_effort: String
     var poll_interval_seconds: Int
     var concurrency: Int
@@ -1889,16 +1891,12 @@ struct SettingsSheetView: View {
     @State private var allowText = ""
     @State private var appIDText = ""
     @State private var appKeyPathText = ""
+    @State private var reviewAgentText = "codex"
     @State private var reviewModelText = ""
+    @State private var discoveredModels: [String: [String]] = [:]
     @State private var liveCommentOn = true
     @State private var saving = false
 
-    private let modelPresets: [(label: String, value: String)] = [
-        ("默认", ""),
-        ("gpt-5.4", "gpt-5.4"),
-        ("gpt-5.3-codex", "gpt-5.3-codex"),
-        ("o3", "o3"),
-    ]
     private let efforts = ["low", "medium", "high", "max"]
     private let fixers = ["codex", "claude", "agy", "pi", "opencode"]
 
@@ -1954,24 +1952,64 @@ struct SettingsSheetView: View {
                                 .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundStyle(.secondary)
 
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text("Review 模型").font(.system(size: 12))
-                                    Spacer()
-                                    HStack(spacing: 4) {
-                                        ForEach(modelPresets, id: \.label) { preset in
-                                            let sel = reviewModelText.trimmingCharacters(in: .whitespacesAndNewlines) == preset.value
-                                            Button(preset.label) { reviewModelText = preset.value }
-                                                .buttonStyle(.plain)
-                                                .font(.system(size: 10.5, weight: sel ? .semibold : .regular))
-                                                .padding(.horizontal, 7)
-                                                .padding(.vertical, 4)
-                                                .background(sel ? Color.accentColor : Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                                                .foregroundStyle(sel ? .white : .primary)
+                            HStack {
+                                Text("Review 引擎").font(.system(size: 12))
+                                Spacer()
+                                HStack(spacing: 4) {
+                                    ForEach(fixers, id: \.self) { ag in
+                                        let sel = reviewAgentText == ag
+                                        Button(ag) {
+                                            if reviewAgentText != ag {
+                                                reviewAgentText = ag
+                                                let avail = discoveredModels[ag] ?? []
+                                                if !reviewModelText.isEmpty && !avail.contains(reviewModelText) {
+                                                    reviewModelText = ""
+                                                }
+                                            }
                                         }
+                                        .buttonStyle(.plain)
+                                        .font(.system(size: 11, weight: sel ? .semibold : .regular))
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 4)
+                                        .background(sel ? Color.accentColor : Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                        .foregroundStyle(sel ? .white : .primary)
                                     }
                                 }
-                                TextField("留空使用 Codex CLI 默认模型，或手动输入模型名", text: $reviewModelText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                let modelsForAgent = discoveredModels[reviewAgentText] ?? []
+                                HStack {
+                                    Text("Review 模型（已自动读取 \(reviewAgentText) 配置 · \(modelsForAgent.count) 个）")
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                                Picker("", selection: Binding(
+                                    get: {
+                                        let cur = reviewModelText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        if cur.isEmpty || modelsForAgent.contains(cur) { return cur }
+                                        return "__custom__"
+                                    },
+                                    set: { val in
+                                        if val != "__custom__" {
+                                            reviewModelText = val
+                                        }
+                                    }
+                                )) {
+                                    Text("默认（跟随 \(reviewAgentText) CLI 配置）").tag("")
+                                    ForEach(modelsForAgent, id: \.self) { m in
+                                        Text(m).tag(m)
+                                    }
+                                    if !reviewModelText.isEmpty && !modelsForAgent.contains(reviewModelText) {
+                                        Text("自定义: \(reviewModelText)").tag("__custom__")
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                TextField("留空使用 CLI 默认模型，或手动输入模型名", text: $reviewModelText)
                                     .textFieldStyle(.roundedBorder)
                                     .font(.system(size: 11.5, design: .monospaced))
                             }
@@ -2130,7 +2168,9 @@ struct SettingsSheetView: View {
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
                     current.allowed_commenters = parsed
+                    current.review_agent = reviewAgentText
                     current.review_model = reviewModelText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    current.discovered_models = nil
                     current.live_status_comment = liveCommentOn
                     current.github_app_id = appIDText.trimmingCharacters(in: .whitespacesAndNewlines)
                     current.github_app_private_key = appKeyPathText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2153,7 +2193,9 @@ struct SettingsSheetView: View {
             let loaded = await store.fetchConfig()
             cfg = loaded
             allowText = (loaded?.allowed_commenters ?? []).joined(separator: ", ")
+            reviewAgentText = (loaded?.review_agent?.isEmpty == false ? loaded?.review_agent : nil) ?? "codex"
             reviewModelText = loaded?.review_model ?? ""
+            discoveredModels = loaded?.discovered_models ?? [:]
             liveCommentOn = loaded?.live_status_comment ?? true
             appIDText = loaded?.github_app_id ?? ""
             appKeyPathText = loaded?.github_app_private_key ?? ""
