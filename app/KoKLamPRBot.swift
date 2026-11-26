@@ -127,6 +127,19 @@ struct ChatMessageItem: Codable, Identifiable, Equatable, Sendable {
     let badge: String?
 }
 
+struct TimelineEventItem: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let at: String
+    let kind: String
+    let actor: String?
+    let pill: String?
+    let summary: String
+    let detail: String?
+    let repo: String?
+    let number: Int?
+    let url: String?
+}
+
 struct BotSnapshot: Codable, Equatable, Sendable {
     let status: String
     let paused: Bool
@@ -144,6 +157,7 @@ struct BotSnapshot: Codable, Equatable, Sendable {
     let pending_decisions: [DecisionItem]?
     let resolved_decisions: [ResolvedDecision]?
     let chat_messages: [ChatMessageItem]?
+    let timeline_events: [TimelineEventItem]?
 }
 
 struct PipelineStep: Codable, Equatable, Sendable {
@@ -307,6 +321,7 @@ final class BotStore: ObservableObject {
     @Published var pendingDecisions: [DecisionItem] = []
     @Published var resolvedDecisions: [ResolvedDecision] = []
     @Published var chatMessages: [ChatMessageItem] = []
+    @Published var timelineEvents: [TimelineEventItem] = []
     @Published var toastMessage: String?
     @Published var lastError: String?
 
@@ -496,6 +511,8 @@ final class BotStore: ObservableObject {
         if resolvedDecisions != resDecs { resolvedDecisions = resDecs }
         let chats = d.chat_messages ?? []
         if chatMessages != chats { chatMessages = chats }
+        let evs = d.timeline_events ?? []
+        if timelineEvents != evs { timelineEvents = evs }
     }
 
     func sendChat(_ text: String) {
@@ -2685,6 +2702,15 @@ struct MainStreamWindowView: View {
                     }
                 }
 
+                // 4.5 Chronological Orca Activity Timeline (Started -> 评审完成 -> 修复中 -> 修复完成)
+                if !store.timelineEvents.isEmpty {
+                    VStack(alignment: .leading, spacing: 7) {
+                        ForEach(store.timelineEvents.suffix(30)) { ev in
+                            timelineEventRow(ev)
+                        }
+                    }
+                }
+
                 // 5. Completed History Stream (compact expandable Orca rows)
                 if !store.history.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
@@ -2898,6 +2924,77 @@ struct MainStreamWindowView: View {
         .padding(14)
         .background(cardColor, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.orange.opacity(0.32), lineWidth: 0.9))
+    }
+
+    private func timelineEventRow(_ ev: TimelineEventItem) -> some View {
+        let isExp = expandedIDs.contains("ev-\(ev.id)")
+        let hasDetail = !(ev.detail ?? "").isEmpty
+        let isStart = ev.kind == "started" || ev.kind == "fix_started"
+        let isFix = ev.kind.hasPrefix("fix_")
+        let dotColor: Color = {
+            switch ev.kind {
+            case "fix_started": return .yellow
+            case "fix_done": return .green
+            case "fix_failed", "failed": return .red
+            case "started": return .orange
+            case "done": return .cyan
+            default: return .white.opacity(0.45)
+            }
+        }()
+        return VStack(alignment: .leading, spacing: 5) {
+            Button {
+                if hasDetail { toggleExpand("ev-\(ev.id)") }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isFix ? "wrench.and.screwdriver" : "sparkles")
+                        .font(.system(size: 11))
+                        .foregroundStyle(dotColor)
+                    if isStart {
+                        Text("Started")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.48))
+                    }
+                    if let actor = ev.actor, !actor.isEmpty {
+                        Text(actor)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.92))
+                    }
+                    Text(ev.summary)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.white.opacity(0.68))
+                        .lineLimit(1)
+                    if hasDetail {
+                        Image(systemName: isExp ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.38))
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExp, let detail = ev.detail, !detail.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(detail)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .textSelection(.enabled)
+                        .lineSpacing(3)
+                    if let uStr = ev.url, let u = URL(string: uStr) {
+                        Button("打开 GitHub PR") { NSWorkspace.shared.open(u) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                    }
+                }
+                .padding(11)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(cardColor, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.7))
+                .padding(.leading, 18)
+            }
+        }
     }
 
     private func historyStreamRow(_ item: HistoryItem) -> some View {

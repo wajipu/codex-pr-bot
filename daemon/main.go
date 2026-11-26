@@ -369,6 +369,19 @@ type ChatMessage struct {
 	Badge string `json:"badge,omitempty"`
 }
 
+type TimelineEvent struct {
+	ID      string `json:"id"`
+	At      string `json:"at"`
+	Kind    string `json:"kind"` // added | started | done | failed | fix_started | fix_done | fix_failed | decision | commented
+	Actor   string `json:"actor,omitempty"`
+	Pill    string `json:"pill,omitempty"`
+	Summary string `json:"summary"`
+	Detail  string `json:"detail,omitempty"`
+	Repo    string `json:"repo,omitempty"`
+	Number  int    `json:"number,omitempty"`
+	URL     string `json:"url,omitempty"`
+}
+
 type State struct {
 	SeenAuto          map[string]string         `json:"seen_auto"`
 	SeenCmd           map[string]string         `json:"seen_cmd"`
@@ -379,6 +392,7 @@ type State struct {
 	PendingDecisions  []DecisionItem            `json:"pending_decisions"`
 	ResolvedDecisions []ResolvedDecision        `json:"resolved_decisions"`
 	ChatMessages      []ChatMessage             `json:"chat_messages"`
+	TimelineEvents    []TimelineEvent           `json:"timeline_events"`
 }
 
 // MARK: - GitHub PR JSON
@@ -511,6 +525,7 @@ type Snapshot struct {
 	PendingDecisions  []DecisionItem     `json:"pending_decisions"`
 	ResolvedDecisions []ResolvedDecision `json:"resolved_decisions"`
 	ChatMessages      []ChatMessage      `json:"chat_messages"`
+	TimelineEvents    []TimelineEvent    `json:"timeline_events"`
 }
 
 type reviewJob struct {
@@ -1531,8 +1546,28 @@ func (b *Bot) triggerManualFix(repo string, number int, reviewBody, agent, sessi
 		}
 
 		b.log(fmt.Sprintf("🚀 手动发送审查建议给 %s 修复 %s#%d", sessLabel, short, pr.Number))
+		b.appendEvent(TimelineEvent{
+			Kind:    "fix_started",
+			Actor:   "PR 修复",
+			Pill:    fmt.Sprintf("%s#%d", short, pr.Number),
+			Summary: fmt.Sprintf("Task: %s#%d 续接 %s 修复 · %s", short, pr.Number, sessLabel, truncate(pr.Title, 50)),
+			Detail:  fullFeedback,
+			Repo:    repo,
+			Number:  pr.Number,
+			URL:     pr.URL,
+		})
 		ok, msg := b.runAutoFix(cfg, repo, pr, fullFeedback, ag, sid, setStage, appendLive)
 		dur := int(time.Since(started).Seconds())
+		b.appendEvent(TimelineEvent{
+			Kind:    map[bool]string{true: "fix_done", false: "fix_failed"}[ok],
+			Actor:   "PR 修复",
+			Pill:    fmt.Sprintf("%s#%d", short, pr.Number),
+			Summary: fmt.Sprintf("%s#%d %s（%ds）", short, pr.Number, truncate(msg, 70), dur),
+			Detail:  msg + "\n\n---\n" + fullFeedback,
+			Repo:    repo,
+			Number:  pr.Number,
+			URL:     pr.URL,
+		})
 
 		b.mu.Lock()
 		var steps []PipelineStep
@@ -1889,6 +1924,15 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	short := shortRepoName(repo)
 	pr := job.PR
 	prKey := fmt.Sprintf("%s#%d", repo, pr.Number)
+	b.appendEvent(TimelineEvent{
+		Kind:    "started",
+		Actor:   "PR 评审",
+		Pill:    fmt.Sprintf("%s#%d", short, pr.Number),
+		Summary: fmt.Sprintf("Task: %s#%d 只读完整评审 · %s", short, pr.Number, truncate(pr.Title, 55)),
+		Repo:    repo,
+		Number:  pr.Number,
+		URL:     pr.URL,
+	})
 	sha8 := shaPrefix(pr.HeadRefOid)
 	started := time.Now()
 
@@ -2135,6 +2179,16 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		verdict = classifyVerdict(reviewBody)
 		testChecklist = extractTestChecklist(reviewBody)
 		finishStep("done", verdict)
+		b.appendEvent(TimelineEvent{
+			Kind:    "done",
+			Actor:   "PR 评审",
+			Pill:    fmt.Sprintf("%s#%d", short, pr.Number),
+			Summary: fmt.Sprintf("%s#%d 评审完成，%s", short, pr.Number, verdict),
+			Detail:  reviewBody,
+			Repo:    repo,
+			Number:  pr.Number,
+			URL:     pr.URL,
+		})
 
 		startStep("回写评论", "回写 GitHub PR 评论...")
 		commentBody := fmt.Sprintf("%s (`%s`)\n\n%s\n\n<sub>触发：%s</sub>\n%s\n",
@@ -2472,6 +2526,8 @@ func (b *Bot) snapshot() Snapshot {
 	copy(resDecs, b.state.ResolvedDecisions)
 	chats := make([]ChatMessage, len(b.state.ChatMessages))
 	copy(chats, b.state.ChatMessages)
+	events := make([]TimelineEvent, len(b.state.TimelineEvents))
+	copy(events, b.state.TimelineEvents)
 	today := time.Now().Format("2006-01-02")
 	return Snapshot{
 		Status:            status,
@@ -2492,7 +2548,24 @@ func (b *Bot) snapshot() Snapshot {
 		PendingDecisions:  decs,
 		ResolvedDecisions: resDecs,
 		ChatMessages:      chats,
+		TimelineEvents:    events,
 	}
+}
+
+func (b *Bot) appendEvent(ev TimelineEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ev.ID == "" {
+		ev.ID = fmt.Sprintf("ev-%d", time.Now().UnixNano())
+	}
+	if ev.At == "" {
+		ev.At = nowISO()
+	}
+	b.state.TimelineEvents = append(b.state.TimelineEvents, ev)
+	if len(b.state.TimelineEvents) > 80 {
+		b.state.TimelineEvents = b.state.TimelineEvents[len(b.state.TimelineEvents)-80:]
+	}
+	writeJSONAtomic(b.statePath, b.state)
 }
 
 func (b *Bot) appendChat(role, text, badge string) {
