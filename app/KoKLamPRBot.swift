@@ -274,6 +274,8 @@ final class BotStore: ObservableObject {
     private var lastNotifiedHistoryID: String?
     private var initializedHistory = false
     private var consecutiveFailures = 0
+    private var lastDaemonStartAttempt: Date = .distantPast
+    @Published var startingDaemon = false
 
     init() {
         let cfg = URLSessionConfiguration.ephemeral
@@ -326,10 +328,85 @@ final class BotStore: ObservableObject {
                     if self.consecutiveFailures >= 3 && self.connected {
                         self.connected = false
                     }
+                    if !self.connected && (self.consecutiveFailures == 1 || self.consecutiveFailures % 5 == 0) {
+                        self.ensureDaemonRunning(force: false)
+                    }
                 }
 
                 let sleepNs: UInt64 = self.activeTasks.isEmpty ? 3_000_000_000 : 1_500_000_000
                 try? await Task.sleep(nanoseconds: sleepNs)
+            }
+        }
+    }
+
+    func ensureDaemonRunning(force: Bool = false) {
+        let now = Date()
+        if !force && now.timeIntervalSince(lastDaemonStartAttempt) < 15 {
+            return
+        }
+        lastDaemonStartAttempt = now
+        startingDaemon = true
+
+        Task.detached(priority: .userInitiated) {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let uid = getuid()
+            let plistPath = "\(home)/Library/LaunchAgents/com.wajipu.koklam-pr-bot.plist"
+
+            var startedViaLaunchd = false
+            if FileManager.default.fileExists(atPath: plistPath) {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                p.arguments = ["bootstrap", "gui/\(uid)", plistPath]
+                p.standardOutput = Pipe()
+                p.standardError = Pipe()
+                try? p.run()
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    startedViaLaunchd = true
+                } else {
+                    // Already bootstrapped — try kickstart
+                    let k = Process()
+                    k.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                    k.arguments = ["kickstart", "gui/\(uid)/com.wajipu.koklam-pr-bot"]
+                    k.standardOutput = Pipe()
+                    k.standardError = Pipe()
+                    try? k.run()
+                    k.waitUntilExit()
+                    startedViaLaunchd = (k.terminationStatus == 0)
+                }
+            }
+
+            if !startedViaLaunchd {
+                if let execURL = Bundle.main.executableURL {
+                    let daemonURL = execURL.deletingLastPathComponent().appendingPathComponent("koklam-pr-botd")
+                    if FileManager.default.isExecutableFile(atPath: daemonURL.path) {
+                        let dataDir = "\(home)/.koklam-pr-bot"
+                        try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+                        let logPath = "\(dataDir)/bot.log"
+                        if !FileManager.default.fileExists(atPath: logPath) {
+                            FileManager.default.createFile(atPath: logPath, contents: nil)
+                        }
+                        let proc = Process()
+                        proc.executableURL = daemonURL
+                        var env = ProcessInfo.processInfo.environment
+                        let extraPath = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+                        env["PATH"] = extraPath + ":" + (env["PATH"] ?? "")
+                        env["HOME"] = home
+                        proc.environment = env
+                        if let fh = FileHandle(forWritingAtPath: logPath) {
+                            fh.seekToEndOfFile()
+                            proc.standardOutput = fh
+                            proc.standardError = fh
+                        }
+                        try? proc.run()
+                    }
+                }
+            }
+
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            await MainActor.run { [weak self] in
+                self?.startingDaemon = false
+                self?.refreshNow()
             }
         }
     }
@@ -752,9 +829,11 @@ struct PopoverView: View {
 
     private var topHeader: some View {
         HStack(spacing: 8) {
-            Image(systemName: "sparkles.rectangle.stack.fill")
-                .font(.system(size: 16))
-                .foregroundStyle(.cyan)
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 20, height: 20)
+                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
             Text("KoKLam PR Bot")
                 .font(.system(size: 14.5, weight: .bold))
 
@@ -913,9 +992,18 @@ struct PopoverView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
-                Button("重试") { store.refreshNow() }
+                HStack(spacing: 8) {
+                    Button(store.startingDaemon ? "正在启动..." : "启动后台服务") {
+                        store.ensureDaemonRunning(force: true)
+                    }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(store.startingDaemon)
+
+                    Button("重试") { store.refreshNow() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
