@@ -119,6 +119,14 @@ struct ResolvedDecision: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+struct ChatMessageItem: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let role: String
+    let at: String
+    let text: String
+    let badge: String?
+}
+
 struct BotSnapshot: Codable, Equatable, Sendable {
     let status: String
     let paused: Bool
@@ -135,6 +143,7 @@ struct BotSnapshot: Codable, Equatable, Sendable {
     let total_usage: TokenUsage?
     let pending_decisions: [DecisionItem]?
     let resolved_decisions: [ResolvedDecision]?
+    let chat_messages: [ChatMessageItem]?
 }
 
 struct PipelineStep: Codable, Equatable, Sendable {
@@ -297,6 +306,7 @@ final class BotStore: ObservableObject {
     @Published var totalUsage: TokenUsage?
     @Published var pendingDecisions: [DecisionItem] = []
     @Published var resolvedDecisions: [ResolvedDecision] = []
+    @Published var chatMessages: [ChatMessageItem] = []
     @Published var toastMessage: String?
     @Published var lastError: String?
 
@@ -484,6 +494,17 @@ final class BotStore: ObservableObject {
         }
         let resDecs = d.resolved_decisions ?? []
         if resolvedDecisions != resDecs { resolvedDecisions = resDecs }
+        let chats = d.chat_messages ?? []
+        if chatMessages != chats { chatMessages = chats }
+    }
+
+    func sendChat(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Task {
+            _ = await post(path: "api/chat", body: ["text": trimmed])
+            refreshNow()
+        }
     }
 
     private func notifyForHistory(_ item: HistoryItem) {
@@ -2349,13 +2370,859 @@ struct PipelineTopologyCard: View {
     }
 }
 
+// MARK: - Orca-Style Unified Stream Desktop Window
+
+struct MainStreamWindowView: View {
+    @ObservedObject var store: BotStore
+    @State private var inputText = ""
+    @State private var expandedIDs: Set<String> = []
+    @State private var showOpenPRsSheet = false
+    @State private var showLogsSheet = false
+    @State private var showSettings = false
+
+    private let bgColor = Color(red: 0.082, green: 0.090, blue: 0.110)
+    private let cardColor = Color(red: 0.118, green: 0.129, blue: 0.157)
+    private let bubbleColor = Color(red: 0.153, green: 0.165, blue: 0.196)
+
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                topBar
+                Divider().overlay(Color.white.opacity(0.07))
+
+                if store.connected {
+                    streamBody
+                    Divider().overlay(Color.white.opacity(0.07))
+                    bottomComposer
+                } else {
+                    disconnectedView
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .frame(minWidth: 680, idealWidth: 880, minHeight: 520, idealHeight: 680)
+        .overlay(alignment: .top) {
+            if let msg = store.toastMessage {
+                Text(msg)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color(red: 0.16, green: 0.18, blue: 0.22), in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.8))
+                    .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+                    .padding(.top, 56)
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheetView(store: store) { showSettings = false }
+        }
+        .sheet(isPresented: $showOpenPRsSheet) {
+            openPRsSheetView
+        }
+        .sheet(isPresented: $showLogsSheet) {
+            logsSheetView
+        }
+    }
+
+    // MARK: - Top Bar (Orca centered pill + clean controls)
+
+    private var topBar: some View {
+        ZStack {
+            // Centered Orca-style pill
+            HStack(spacing: 7) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 18, height: 18)
+                    .clipShape(Circle())
+                Text("PR 评审")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(Color.white.opacity(0.07), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.10), lineWidth: 0.7))
+
+            HStack(spacing: 10) {
+                // Left: status + Open PR button + token badge
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(statusDotColor)
+                        .frame(width: 7, height: 7)
+                    Text(statusShortText)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.05), in: Capsule())
+
+                Button {
+                    showOpenPRsSheet = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.triangle.pull")
+                            .font(.system(size: 10.5))
+                        Text("Open PR (\(store.openPRs.count))")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.06), in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.09), lineWidth: 0.7))
+                }
+                .buttonStyle(.plain)
+
+                if let today = store.todayUsage, today.netTokens > 0 {
+                    Text("今日 \(formatTokens(today.netTokens))")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+
+                Spacer()
+
+                // Right: compact icon actions
+                if let latest = store.latestVersion {
+                    Button {
+                        store.openUpdateOrCheck()
+                    } label: {
+                        Text("↑ \(latest)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.green)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.green.opacity(0.15), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                iconBtn("terminal", help: "运行日志") { showLogsSheet = true }
+                iconBtn("bell", help: "测试系统通知") { store.sendTestNotification() }
+                iconBtn("arrow.clockwise", help: "立即扫描") { store.triggerScan() }
+                iconBtn(store.paused ? "play.fill" : "pause.fill", help: store.paused ? "恢复轮询" : "暂停轮询") {
+                    store.togglePause()
+                }
+                iconBtn("gearshape", help: "设置") { showSettings = true }
+            }
+            .padding(.horizontal, 18)
+        }
+        .frame(height: 48)
+    }
+
+    private func iconBtn(_ name: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name)
+                .font(.system(size: 12.5))
+                .foregroundStyle(.white.opacity(0.68))
+                .frame(width: 26, height: 26)
+                .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private var statusDotColor: Color {
+        if !store.connected { return .red }
+        if store.paused { return .yellow }
+        if !store.activeTasks.isEmpty { return .orange }
+        return .green
+    }
+
+    private var statusShortText: String {
+        if !store.connected { return "未连接" }
+        if store.paused { return "已暂停" }
+        if !store.activeTasks.isEmpty { return "评审中 \(store.activeTasks.count)/\(store.concurrency)" }
+        if let s = store.nextScanInSec { return "待命 · \(s)s" }
+        return "待命"
+    }
+
+    // MARK: - Unified Orca Stream Body
+
+    private var streamBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                // 1. Empty state welcome
+                if store.chatMessages.isEmpty && store.activeTasks.isEmpty && store.pendingDecisions.isEmpty && store.history.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(nsImage: NSApp.applicationIconImage)
+                            .resizable()
+                            .frame(width: 44, height: 44)
+                            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            .opacity(0.85)
+                        Text("KoKLam PR 评审已就绪")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.88))
+                        Text("当前监听 \(store.openPRs.count) 个 Open PR。你可以在下方直接说「open 都看下吧」，或在 GitHub PR 评论区 @koklam-pr-bot。")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.white.opacity(0.5))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 460)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 64)
+                }
+
+                // 2. Chat conversation bubbles (oldest -> newest)
+                if !store.chatMessages.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(store.chatMessages.suffix(20)) { msg in
+                            if msg.role == "user" {
+                                HStack {
+                                    Spacer(minLength: 100)
+                                    Text(msg.text)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.white.opacity(0.92))
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 9)
+                                        .background(bubbleColor, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.7))
+                                }
+                            } else {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(nsImage: NSApp.applicationIconImage)
+                                        .resizable()
+                                        .frame(width: 20, height: 20)
+                                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                        .padding(.top, 1)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        if let badge = msg.badge, !badge.isEmpty {
+                                            taskPill(badge, dotColor: .cyan)
+                                        }
+                                        Text(msg.text)
+                                            .font(.system(size: 13))
+                                            .foregroundStyle(.white.opacity(0.84))
+                                            .textSelection(.enabled)
+                                    }
+                                    Spacer()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Active & Queued Work Block (exact Orca style!)
+                if !store.activeTasks.isEmpty || !store.pendingQueue.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Image(nsImage: NSApp.applicationIconImage)
+                                .resizable()
+                                .frame(width: 20, height: 20)
+                                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            let maxElapsed = store.activeTasks.map(\.elapsed_sec).max() ?? 0
+                            Text("工作中 · \(store.activeTasks.count) 个任务 · \(formatDuration(maxElapsed))")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.65))
+                            Spacer()
+                        }
+
+                        Divider().overlay(Color.white.opacity(0.08))
+
+                        ForEach(store.activeTasks) { t in
+                            activeTaskRow(t)
+                        }
+
+                        ForEach(store.pendingQueue) { q in
+                            HStack(spacing: 8) {
+                                Image(systemName: "clock")
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(.white.opacity(0.4))
+                                Text("Queued")
+                                    .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.55))
+                                Text("PR 评审")
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.75))
+                                Text("\(q.displayRepo)#\(q.number) · \(q.title)")
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(.white.opacity(0.5))
+                                    .lineLimit(1)
+                                Spacer()
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+
+                // 4. Inline Pending Decisions (Orca style — right in the stream!)
+                if !store.pendingDecisions.isEmpty {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(store.pendingDecisions) { dec in
+                            inlineDecisionCard(dec)
+                        }
+                    }
+                }
+
+                // 5. Completed History Stream (compact expandable Orca rows)
+                if !store.history.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Image(nsImage: NSApp.applicationIconImage)
+                                .resizable()
+                                .frame(width: 18, height: 18)
+                                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            Text("评审与执行记录（\(store.history.count)）")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.5))
+                            Spacer()
+                        }
+                        Divider().overlay(Color.white.opacity(0.07))
+
+                        ForEach(store.history.prefix(25)) { item in
+                            historyStreamRow(item)
+                        }
+                    }
+                }
+
+                // 6. Resolved Decisions (compact Orca reply records)
+                if !store.resolvedDecisions.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(store.resolvedDecisions.prefix(6)) { r in
+                            HStack {
+                                Spacer(minLength: 120)
+                                VStack(alignment: .trailing, spacing: 4) {
+                                    taskPill("\(r.displayRepo)#\(r.number) · \(r.title)", dotColor: .yellow)
+                                    Text(r.reply_text)
+                                        .font(.system(size: 12.5))
+                                        .foregroundStyle(.white.opacity(0.9))
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(bubbleColor, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.7))
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: 780, alignment: .leading)
+            .padding(.horizontal, 28)
+            .padding(.vertical, 22)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    // MARK: - Stream Row Components
+
+    private func activeTaskRow(_ t: ActiveTask) -> some View {
+        let isExp = expandedIDs.contains("act-\(t.id)")
+        return VStack(alignment: .leading, spacing: 6) {
+            Button {
+                toggleExpand("act-\(t.id)")
+            } label: {
+                HStack(spacing: 7) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.75)
+                    Text("Started")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.white.opacity(0.5))
+                    Text("PR 评审")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.9))
+                    Text("\(t.displayRepo)#\(t.number) · \(t.stage) (\(formatDuration(t.elapsed_sec)))")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .lineLimit(1)
+                    Image(systemName: isExp ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.4))
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExp {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(t.title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.88))
+                    if let steps = t.steps, !steps.isEmpty {
+                        HStack(spacing: 8) {
+                            ForEach(Array(steps.enumerated()), id: \.offset) { _, st in
+                                HStack(spacing: 4) {
+                                    Circle()
+                                        .fill(st.status == "done" ? Color.green : (st.status == "running" ? Color.orange : Color.red))
+                                        .frame(width: 5.5, height: 5.5)
+                                    Text(st.name)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.white.opacity(0.75))
+                                }
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Color.white.opacity(0.05), in: Capsule())
+                            }
+                        }
+                    }
+                    if let lines = t.live_lines, !lines.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(lines.suffix(12).enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.62))
+                                    .lineLimit(2)
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                .padding(12)
+                .background(cardColor, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.white.opacity(0.07), lineWidth: 0.7))
+                .padding(.leading, 20)
+            }
+        }
+    }
+
+    private func inlineDecisionCard(_ dec: DecisionItem) -> some View {
+        let isExp = expandedIDs.contains("dec-\(dec.id)")
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "checklist")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.white.opacity(0.5))
+                Text("就")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.white.opacity(0.55))
+                taskPill("\(dec.displayRepo)#\(dec.number) · \(dec.title)", dotColor: .orange)
+                Text("向你提问")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.white.opacity(0.55))
+                Spacer()
+            }
+
+            Text(dec.question)
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.95))
+                .textSelection(.enabled)
+
+            if !dec.context.isEmpty {
+                Button {
+                    toggleExpand("dec-\(dec.id)")
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(isExp ? "收起详细评审上下文" : "查看详细评审上下文")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.55))
+                        Image(systemName: isExp ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+                .buttonStyle(.plain)
+
+                if isExp {
+                    Text(dec.context)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .textSelection(.enabled)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button("授权新开会话修复") {
+                    store.replyDecision(id: dec.id, action: "authorize_fix", replyText: "授权新开会话修复")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Button("合并 PR") {
+                    store.replyDecision(id: dec.id, action: "merge", replyText: "直接合并 PR")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button("忽略") {
+                    store.replyDecision(id: dec.id, action: "dismiss", replyText: "忽略")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer()
+
+                if let u = URL(string: dec.url) {
+                    Button("打开 GitHub") { NSWorkspace.shared.open(u) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.cyan.opacity(0.85))
+                }
+            }
+            .padding(.top, 2)
+        }
+        .padding(14)
+        .background(cardColor, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.orange.opacity(0.32), lineWidth: 0.9))
+    }
+
+    private func historyStreamRow(_ item: HistoryItem) -> some View {
+        let isExp = expandedIDs.contains("his-\(item.id)")
+        let badge = historyVerdictLabel(item)
+        return VStack(alignment: .leading, spacing: 6) {
+            Button {
+                toggleExpand("his-\(item.id)")
+            } label: {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(badge.color)
+                        .frame(width: 6.5, height: 6.5)
+                    Text("PR 评审")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.9))
+                    Text("\(item.displayRepo)#\(item.number) \(badge.text)")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                    if let u = item.usage, u.netTokens > 0 {
+                        Text("· \(formatTokens(u.netTokens))")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.38))
+                    }
+                    Image(systemName: isExp ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.38))
+                    Spacer()
+                    Text("\(item.duration_sec)s")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.35))
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExp {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(item.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+
+                    Text(item.body.isEmpty ? item.summary : item.body)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .textSelection(.enabled)
+                        .lineSpacing(3)
+
+                    if let tests = item.test_checklist, !tests.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("🧪 待测试功能清单")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(.orange)
+                            ForEach(tests, id: \.self) { t in
+                                Text("• \(t)")
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(.white.opacity(0.8))
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    HStack(spacing: 8) {
+                        if let u = URL(string: item.url) {
+                            Button("打开 PR") { NSWorkspace.shared.open(u) }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                        Button("重新 Review") {
+                            store.triggerManualReview(repo: item.repo, number: item.number, note: "", agentSession: "")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        if item.merged != true {
+                            Button("立即派修") {
+                                store.sendToAgentFix(repo: item.repo, number: item.number, reviewBody: item.body, agent: "", sessionID: "", note: "")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            Button("合并 PR") {
+                                store.mergePR(repo: item.repo, number: item.number)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        Spacer()
+                    }
+                }
+                .padding(14)
+                .background(cardColor, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.7))
+                .padding(.leading, 16)
+            }
+        }
+    }
+
+    private func taskPill(_ text: String, dotColor: Color) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(dotColor).frame(width: 6, height: 6)
+            Text(text)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.88))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+
+    private func historyVerdictLabel(_ item: HistoryItem) -> (text: String, color: Color) {
+        if !item.ok { return ("执行失败", .red) }
+        if item.merged == true { return ("评审通过，已自动合并", .purple) }
+        if item.fix_dispatched == true { return ("建议修改，已派回修复", .blue) }
+        let v = item.verdict ?? ""
+        if v.contains("通过") { return ("评审通过", .green) }
+        if v.contains("阻塞") || v.contains("风险") { return ("建议暂缓合并", .red) }
+        return ("评审完成，建议修改", .orange)
+    }
+
+    private func toggleExpand(_ id: String) {
+        if expandedIDs.contains(id) {
+            expandedIDs.remove(id)
+        } else {
+            expandedIDs.insert(id)
+        }
+    }
+
+    // MARK: - Bottom Chat / Command Bar
+
+    private var bottomComposer: some View {
+        VStack(spacing: 8) {
+            // Quick prompt chips
+            HStack(spacing: 8) {
+                quickChip("open 都看下吧")
+                quickChip("扫描新 PR")
+                if let firstDec = store.pendingDecisions.first {
+                    quickChip("授权新开会话修复 #\(firstDec.number)")
+                }
+                Spacer()
+            }
+            .frame(maxWidth: 780)
+
+            HStack(spacing: 10) {
+                TextField(
+                    store.pendingDecisions.isEmpty
+                        ? "输入指令，例如：open 都看下吧 / 审 #63 / 修 #42..."
+                        : "直接回复待拍板问题，或输入指令（如 open 都看下吧）...",
+                    text: $inputText
+                )
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .foregroundStyle(.white)
+                .onSubmit { submitInput() }
+
+                Button {
+                    submitInput()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .white.opacity(0.22) : .white.opacity(0.9))
+                }
+                .buttonStyle(.plain)
+                .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(cardColor, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.11), lineWidth: 0.8))
+            .frame(maxWidth: 780)
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 12)
+        .background(bgColor)
+    }
+
+    private func quickChip(_ text: String) -> some View {
+        Button(text) {
+            store.sendChat(text)
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 11.5))
+        .foregroundStyle(.white.opacity(0.68))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(0.05), in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.09), lineWidth: 0.6))
+    }
+
+    private func submitInput() {
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        inputText = ""
+        store.sendChat(trimmed)
+    }
+
+    // MARK: - Disconnected State
+
+    private var disconnectedView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "bolt.slash")
+                .font(.system(size: 32))
+                .foregroundStyle(.white.opacity(0.4))
+            Text("正在连接本地后台服务...")
+                .font(.system(size: 14))
+                .foregroundStyle(.white.opacity(0.65))
+            if let err = store.lastError {
+                Text(err)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.red.opacity(0.85))
+            }
+            HStack(spacing: 10) {
+                Button(store.startingDaemon ? "正在启动..." : "启动后台服务") {
+                    store.ensureDaemonRunning(force: true)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(store.startingDaemon)
+
+                Button("重试") { store.refreshNow() }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Auxiliary Sheets (Open PRs & Logs)
+
+    private var openPRsSheetView: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Open PR 列表 (\(store.openPRs.count))")
+                    .font(.system(size: 14, weight: .bold))
+                Spacer()
+                Button("全部评审") {
+                    showOpenPRsSheet = false
+                    store.sendChat("open 都看下吧")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button("关闭") { showOpenPRsSheet = false }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .padding(14)
+            Divider().opacity(0.2)
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(store.openPRs) { pr in
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text("\(pr.displayRepo)#\(pr.number)")
+                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.cyan)
+                                    Text(pr.title)
+                                        .font(.system(size: 12.5, weight: .medium))
+                                        .lineLimit(1)
+                                }
+                                Text("\(pr.head) → \(pr.base) · \(pr.sha8)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("评审") {
+                                store.triggerManualReview(repo: pr.repo, number: pr.number, note: "", agentSession: "")
+                                showOpenPRsSheet = false
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            if let u = URL(string: pr.url) {
+                                Button("打开") { NSWorkspace.shared.open(u) }
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(10)
+                        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .frame(width: 560, height: 460)
+    }
+
+    private var logsSheetView: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("后台运行日志")
+                    .font(.system(size: 14, weight: .bold))
+                Spacer()
+                Button("关闭") { showLogsSheet = false }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .padding(14)
+            Divider().opacity(0.2)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(store.logs.suffix(120).enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.78))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .frame(width: 620, height: 460)
+    }
+
+    private func formatDuration(_ sec: Int) -> String {
+        if sec < 60 { return "\(sec)s" }
+        return "\(sec / 60)m \(sec % 60)s"
+    }
+
+    private func formatTokens(_ n: Int64) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
+    }
+}
+
 @main
-struct CodexPRBotApp: App {
+struct KoKLamPRBotApp: App {
     @StateObject private var store = BotStore()
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
+        WindowGroup("KoKLam PR Bot", id: "main") {
+            MainStreamWindowView(store: store)
+        }
+        .defaultSize(width: 880, height: 680)
+
         MenuBarExtra {
-            PopoverView(store: store)
+            Button("打开 KoKLam PR Bot 主窗口") {
+                openWindow(id: "main")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            Divider()
+            Button("立即扫描 Open PR") {
+                store.triggerScan()
+            }
+            Button(store.paused ? "恢复自动轮询" : "暂停自动轮询") {
+                store.togglePause()
+            }
+            Button("发送测试通知") {
+                store.sendTestNotification()
+            }
+            Divider()
+            Button("退出 KoKLam PR Bot") {
+                NSApp.terminate(nil)
+            }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: store.menuBarSymbol)
@@ -2365,6 +3232,5 @@ struct CodexPRBotApp: App {
                 }
             }
         }
-        .menuBarExtraStyle(.window)
     }
 }

@@ -361,6 +361,14 @@ type ResolvedDecision struct {
 	ResultNote string `json:"result_note"`
 }
 
+type ChatMessage struct {
+	ID    string `json:"id"`
+	Role  string `json:"role"` // user | assistant | event
+	At    string `json:"at"`
+	Text  string `json:"text"`
+	Badge string `json:"badge,omitempty"`
+}
+
 type State struct {
 	SeenAuto          map[string]string         `json:"seen_auto"`
 	SeenCmd           map[string]string         `json:"seen_cmd"`
@@ -370,6 +378,7 @@ type State struct {
 	DailyUsage        map[string]TokenUsage     `json:"daily_usage"`
 	PendingDecisions  []DecisionItem            `json:"pending_decisions"`
 	ResolvedDecisions []ResolvedDecision        `json:"resolved_decisions"`
+	ChatMessages      []ChatMessage             `json:"chat_messages"`
 }
 
 // MARK: - GitHub PR JSON
@@ -501,6 +510,7 @@ type Snapshot struct {
 	TotalUsage        TokenUsage         `json:"total_usage"`
 	PendingDecisions  []DecisionItem     `json:"pending_decisions"`
 	ResolvedDecisions []ResolvedDecision `json:"resolved_decisions"`
+	ChatMessages      []ChatMessage      `json:"chat_messages"`
 }
 
 type reviewJob struct {
@@ -2460,6 +2470,8 @@ func (b *Bot) snapshot() Snapshot {
 	copy(decs, b.state.PendingDecisions)
 	resDecs := make([]ResolvedDecision, len(b.state.ResolvedDecisions))
 	copy(resDecs, b.state.ResolvedDecisions)
+	chats := make([]ChatMessage, len(b.state.ChatMessages))
+	copy(chats, b.state.ChatMessages)
 	today := time.Now().Format("2006-01-02")
 	return Snapshot{
 		Status:            status,
@@ -2479,7 +2491,36 @@ func (b *Bot) snapshot() Snapshot {
 		TotalUsage:        b.state.TotalUsage,
 		PendingDecisions:  decs,
 		ResolvedDecisions: resDecs,
+		ChatMessages:      chats,
 	}
+}
+
+func (b *Bot) appendChat(role, text, badge string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.state.ChatMessages = append(b.state.ChatMessages, ChatMessage{
+		ID:    fmt.Sprintf("msg-%d", time.Now().UnixNano()),
+		Role:  role,
+		At:    nowISO(),
+		Text:  strings.TrimSpace(text),
+		Badge: badge,
+	})
+	if len(b.state.ChatMessages) > 60 {
+		b.state.ChatMessages = b.state.ChatMessages[len(b.state.ChatMessages)-60:]
+	}
+	writeJSONAtomic(b.statePath, b.state)
+}
+
+func (b *Bot) findOpenPRByNumber(num int) *OpenPR {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i := range b.openPRs {
+		if b.openPRs[i].Number == num {
+			cp := b.openPRs[i]
+			return &cp
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -2516,6 +2557,165 @@ func main() {
 		default:
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "message": "已触发立即扫描"})
+	})
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"ok": false})
+			return
+		}
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Text) == "" {
+			writeJSON(w, 400, map[string]any{"ok": false, "message": "消息不能为空"})
+			return
+		}
+		text := strings.TrimSpace(body.Text)
+		lower := strings.ToLower(text)
+		bot.appendChat("user", text, "")
+
+		numRe := regexp.MustCompile(`#(\d+)`)
+		numMatch := numRe.FindStringSubmatch(text)
+		prNum := 0
+		if len(numMatch) > 1 {
+			prNum, _ = strconv.Atoi(numMatch[1])
+		}
+
+		// 1. Targeted PR command (#N)
+		if prNum > 0 {
+			pr := bot.findOpenPRByNumber(prNum)
+			if pr == nil {
+				msg := fmt.Sprintf("未在当前 Open PR 列表中找到 #%d，先尝试刷新扫描一下。", prNum)
+				bot.appendChat("assistant", msg, "")
+				select {
+				case bot.wakeScan <- struct{}{}:
+				default:
+				}
+				writeJSON(w, 200, map[string]any{"ok": true, "message": msg})
+				return
+			}
+			if strings.Contains(lower, "修") || strings.Contains(lower, "fix") {
+				ok, msg := bot.triggerManualFix(pr.Repo, pr.Number, "", "", "", text)
+				bot.appendChat("assistant", msg, fmt.Sprintf("%s#%d", pr.ShortRepo, pr.Number))
+				writeJSON(w, 200, map[string]any{"ok": ok, "message": msg})
+				return
+			}
+			if strings.Contains(lower, "审") || strings.Contains(lower, "review") || strings.Contains(lower, "看") {
+				go func(target OpenPR) {
+					cfg := bot.reloadConfig()
+					gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+					out, _, err := runCmd(context.Background(), "", "", gh, "pr", "view", strconv.Itoa(target.Number), "-R", target.Repo, "--json", "number,title,url,body,headRefName,headRefOid,baseRefName,isDraft,updatedAt,comments")
+					if err != nil {
+						return
+					}
+					var gpr GHPR
+					if json.Unmarshal([]byte(out), &gpr) == nil {
+						bot.enqueueJob(reviewJob{
+							Repo:        target.Repo,
+							PR:          gpr,
+							StateKey:    fmt.Sprintf("manual|%s#%d:%d", target.Repo, target.Number, time.Now().Unix()),
+							Marker:      fmt.Sprintf("<!-- codex-cli-review-manual:%d -->", time.Now().Unix()),
+							TriggerInfo: "对话指令（" + truncate(text, 80) + "）",
+						})
+					}
+				}(*pr)
+				msg := fmt.Sprintf("已启动对 `%s#%d` 的只读评审，完成后会在此汇总结论。", pr.ShortRepo, pr.Number)
+				bot.appendChat("assistant", msg, fmt.Sprintf("%s#%d", pr.ShortRepo, pr.Number))
+				writeJSON(w, 200, map[string]any{"ok": true, "message": msg})
+				return
+			}
+		}
+
+		// 2. Scan / review all Open PRs
+		if strings.Contains(lower, "open") || strings.Contains(lower, "全审") || strings.Contains(lower, "都看") || strings.Contains(lower, "扫描") || strings.Contains(lower, "scan") {
+			forceAll := strings.Contains(lower, "都看") || strings.Contains(lower, "全审") || strings.Contains(lower, "重审")
+			bot.mu.Lock()
+			if bot.paused {
+				bot.paused = false
+			}
+			openCopy := make([]OpenPR, len(bot.openPRs))
+			copy(openCopy, bot.openPRs)
+			bot.mu.Unlock()
+
+			select {
+			case bot.wakeScan <- struct{}{}:
+			default:
+			}
+			if forceAll && len(openCopy) > 0 {
+				go func(prs []OpenPR) {
+					cfg := bot.reloadConfig()
+					gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+					for _, target := range prs {
+						if target.IsDraft && boolDefault(cfg.SkipDraft, true) {
+							continue
+						}
+						out, _, err := runCmd(context.Background(), "", "", gh, "pr", "view", strconv.Itoa(target.Number), "-R", target.Repo, "--json", "number,title,url,body,headRefName,headRefOid,baseRefName,isDraft,updatedAt,comments")
+						if err != nil {
+							continue
+						}
+						var gpr GHPR
+						if json.Unmarshal([]byte(out), &gpr) == nil {
+							bot.enqueueJob(reviewJob{
+								Repo:        target.Repo,
+								PR:          gpr,
+								StateKey:    fmt.Sprintf("manual|%s#%d:%d", target.Repo, target.Number, time.Now().UnixNano()),
+								Marker:      fmt.Sprintf("<!-- codex-cli-review-manual:%d -->", time.Now().Unix()),
+								TriggerInfo: "对话指令（" + truncate(text, 80) + "）",
+							})
+						}
+					}
+				}(openCopy)
+				msg := fmt.Sprintf("已启动对当前全部 **%d 个 Open PR** 的只读评审，正在按并发队列同步检查，完成后会逐条汇总结论。", len(openCopy))
+				bot.appendChat("assistant", msg, fmt.Sprintf("全部 %d 个 Open PR", len(openCopy)))
+				writeJSON(w, 200, map[string]any{"ok": true, "message": msg})
+				return
+			}
+			msg := "已触发全仓库 Open PR 扫描，发现新提交会自动进入评审队列。"
+			bot.appendChat("assistant", msg, "Open PR 扫描")
+			writeJSON(w, 200, map[string]any{"ok": true, "message": msg})
+			return
+		}
+
+		// 3. Reply to latest pending decision if any
+		bot.mu.Lock()
+		var latestDec *DecisionItem
+		if len(bot.state.PendingDecisions) > 0 {
+			cp := bot.state.PendingDecisions[0]
+			latestDec = &cp
+		}
+		bot.mu.Unlock()
+		if latestDec != nil {
+			dec := bot.removeDecision(latestDec.ID)
+			if dec != nil {
+				if strings.Contains(lower, "忽略") || strings.Contains(lower, "跳过") || strings.Contains(lower, "取消") || strings.Contains(lower, "dismiss") {
+					bot.recordResolvedDecision(dec, "dismiss", text, "已通过对话忽略")
+					msg := fmt.Sprintf("已忽略 `%s#%d` 的待拍板事项。", dec.ShortRepo, dec.Number)
+					bot.appendChat("assistant", msg, fmt.Sprintf("%s#%d", dec.ShortRepo, dec.Number))
+					writeJSON(w, 200, map[string]any{"ok": true, "message": msg})
+					return
+				}
+				agent := ""
+				sid := ""
+				if strings.Contains(lower, "新开") || strings.Contains(lower, "新会话") || strings.Contains(lower, "new") {
+					sid = "new"
+				}
+				for _, a := range []string{"codex", "claude", "agy", "pi", "opencode"} {
+					if strings.Contains(lower, a) {
+						agent = a
+						break
+					}
+				}
+				ok, resMsg := bot.triggerManualFix(dec.Repo, dec.Number, dec.Context, agent, sid, text)
+				bot.recordResolvedDecision(dec, "authorize_fix", text, resMsg)
+				bot.appendChat("assistant", resMsg, fmt.Sprintf("%s#%d", dec.ShortRepo, dec.Number))
+				writeJSON(w, 200, map[string]any{"ok": ok, "message": resMsg})
+				return
+			}
+		}
+
+		helpMsg := "收到！你可以直接对我说：`open 都看下吧`、`审 #63`、`修 #42`，或者在出现待拍板卡片时直接输入你的决定。"
+		bot.appendChat("assistant", helpMsg, "")
+		writeJSON(w, 200, map[string]any{"ok": true, "message": helpMsg})
 	})
 	mux.HandleFunc("/api/toggle-pause", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
