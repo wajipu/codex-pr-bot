@@ -2604,6 +2604,12 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--mcp" {
+			runMCPServer()
+			return
+		}
+	}
 	bot := newBot()
 	port := intDefault(bot.cfg.Port, 18787)
 	conc := intDefault(bot.cfg.Concurrency, 3)

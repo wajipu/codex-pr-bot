@@ -54,6 +54,21 @@ curl -fsSL https://raw.githubusercontent.com/wajipu/koklam-pr-bot/main/scripts/i
 }
 ```
 
+## 内置 MCP Server（Agent 闭环评审）
+
+`koklam-pr-botd --mcp` 内置标准 stdio MCP Server，任何支持 MCP 的 Agent（Codex / Claude Code / Antigravity / Cursor / OpenCode）在提完 PR 或修完代码后，可直接调用 `review_pr(repo, number, wait=true)` 触发评审并同步拿到完整评审意见，带着原会话上下文直接修改再复审，形成完整闭环：
+
+```json
+{
+  "mcpServers": {
+    "koklam-pr-bot": {
+      "command": "/Applications/KoKLam PR Bot.app/Contents/MacOS/koklam-pr-botd",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
 ## 自动打包与发布（GitHub Actions）
 
 推送任意 `v*` 标签即可自动触发 `.github/workflows/release.yml` 在 `macos-15` runner 上编译打包 `.zip`、`.dmg` 与 `SHA256SUMS.txt` 并发布到 GitHub Releases：
