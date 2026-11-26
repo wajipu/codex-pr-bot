@@ -2374,6 +2374,8 @@ struct PipelineTopologyCard: View {
 
 struct MainStreamWindowView: View {
     @ObservedObject var store: BotStore
+    var isPopover: Bool = true
+    var onPopOut: (() -> Void)? = nil
     @State private var inputText = ""
     @State private var expandedIDs: Set<String> = []
     @State private var showOpenPRsSheet = false
@@ -2402,7 +2404,12 @@ struct MainStreamWindowView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .frame(minWidth: 680, idealWidth: 880, minHeight: 520, idealHeight: 680)
+        .frame(
+            minWidth: isPopover ? 560 : 680,
+            idealWidth: isPopover ? 580 : 860,
+            minHeight: isPopover ? 620 : 520,
+            idealHeight: isPopover ? 660 : 680
+        )
         .overlay(alignment: .top) {
             if let msg = store.toastMessage {
                 Text(msg)
@@ -2508,8 +2515,14 @@ struct MainStreamWindowView: View {
                     store.togglePause()
                 }
                 iconBtn("gearshape", help: "设置") { showSettings = true }
+                if let popOut = onPopOut {
+                    iconBtn("arrow.up.left.and.arrow.down.right", help: "弹出独立大窗口") { popOut() }
+                }
+                if isPopover {
+                    iconBtn("power", help: "退出 KoKLam PR Bot") { NSApp.terminate(nil) }
+                }
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, isPopover ? 12 : 18)
         }
         .frame(height: 48)
     }
@@ -2700,8 +2713,8 @@ struct MainStreamWindowView: View {
                 }
             }
             .frame(maxWidth: 780, alignment: .leading)
-            .padding(.horizontal, 28)
-            .padding(.vertical, 22)
+            .padding(.horizontal, isPopover ? 16 : 28)
+            .padding(.vertical, 16)
             .frame(maxWidth: .infinity)
         }
     }
@@ -3038,8 +3051,8 @@ struct MainStreamWindowView: View {
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.11), lineWidth: 0.8))
             .frame(maxWidth: 780)
         }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 12)
+        .padding(.horizontal, isPopover ? 14 : 28)
+        .padding(.vertical, 10)
         .background(bgColor)
     }
 
@@ -3199,29 +3212,10 @@ struct KoKLamPRBotApp: App {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
-        WindowGroup("KoKLam PR Bot", id: "main") {
-            MainStreamWindowView(store: store)
-        }
-        .defaultSize(width: 880, height: 680)
-
         MenuBarExtra {
-            Button("打开 KoKLam PR Bot 主窗口") {
+            MainStreamWindowView(store: store, isPopover: true) {
                 openWindow(id: "main")
                 NSApp.activate(ignoringOtherApps: true)
-            }
-            Divider()
-            Button("立即扫描 Open PR") {
-                store.triggerScan()
-            }
-            Button(store.paused ? "恢复自动轮询" : "暂停自动轮询") {
-                store.togglePause()
-            }
-            Button("发送测试通知") {
-                store.sendTestNotification()
-            }
-            Divider()
-            Button("退出 KoKLam PR Bot") {
-                NSApp.terminate(nil)
             }
         } label: {
             HStack(spacing: 4) {
@@ -3232,5 +3226,11 @@ struct KoKLamPRBotApp: App {
                 }
             }
         }
+        .menuBarExtraStyle(.window)
+
+        Window("KoKLam PR Bot", id: "main") {
+            MainStreamWindowView(store: store, isPopover: false)
+        }
+        .defaultSize(width: 860, height: 680)
     }
 }
