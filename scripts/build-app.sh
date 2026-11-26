@@ -28,6 +28,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <string>KoKLam PR Bot</string>
     <key>CFBundleDisplayName</key>
     <string>KoKLam PR Bot</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -50,6 +52,20 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 EOF
 
 cp "$ROOT_DIR/config.example.json" "$APP_DIR/Contents/Resources/config.example.json"
+
+if [[ -f "$ROOT_DIR/app/AppIcon.png" ]]; then
+  echo "==> Generating AppIcon.icns..."
+  ICONSET_DIR="$ABS_OUT_DIR/AppIcon.iconset"
+  rm -rf "$ICONSET_DIR"
+  mkdir -p "$ICONSET_DIR"
+  for sz in 16 32 128 256 512; do
+    sips -z $sz $sz "$ROOT_DIR/app/AppIcon.png" --out "$ICONSET_DIR/icon_${sz}x${sz}.png" >/dev/null
+    sz2=$((sz * 2))
+    sips -z $sz2 $sz2 "$ROOT_DIR/app/AppIcon.png" --out "$ICONSET_DIR/icon_${sz}x${sz}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
+  rm -rf "$ICONSET_DIR"
+fi
 
 echo "==> Building Go daemon (koklam-pr-botd)..."
 (cd "$ROOT_DIR/daemon" && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$APP_DIR/Contents/MacOS/koklam-pr-botd" .)
