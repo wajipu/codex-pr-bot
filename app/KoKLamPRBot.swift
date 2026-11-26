@@ -14,13 +14,47 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate, @u
     }
 
     func send(title: String, subtitle: String, body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.subtitle = subtitle
-        content.body = body
-        content.sound = .default
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req) { _ in }
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { [weak self] settings in
+            let ok = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+            if ok {
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.subtitle = subtitle
+                content.body = body
+                content.sound = .default
+                let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+                center.add(req) { err in
+                    if err != nil {
+                        self?.sendViaOsascript(title: title, subtitle: subtitle, body: body)
+                    }
+                }
+            } else {
+                if settings.authorizationStatus == .notDetermined {
+                    center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+                }
+                self?.sendViaOsascript(title: title, subtitle: subtitle, body: body)
+            }
+        }
+    }
+
+    private func sendViaOsascript(title: String, subtitle: String, body: String) {
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\")
+             .replacingOccurrences(of: "\"", with: "\\\"")
+             .replacingOccurrences(of: "\n", with: " ")
+        }
+        var script = "display notification \"\(esc(body))\" with title \"\(esc(title))\""
+        if !subtitle.isEmpty {
+            script += " subtitle \"\(esc(subtitle))\""
+        }
+        script += " sound name \"Glass\""
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        try? p.run()
     }
 
     func userNotificationCenter(
