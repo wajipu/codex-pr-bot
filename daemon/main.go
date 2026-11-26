@@ -1391,10 +1391,29 @@ func (b *Bot) scanOnce() int {
 	}
 
 	nowStr := nowISO()
+	openSet := make(map[string]bool, len(foundPRs))
+	for _, p := range foundPRs {
+		openSet[fmt.Sprintf("%s#%d", p.Repo, p.Number)] = true
+	}
 	b.mu.Lock()
 	b.openPRs = foundPRs
 	b.lastScanAt = &nowStr
 	b.scanning = false
+	if len(b.state.PendingDecisions) > 0 && len(cfg.Repos) > 0 {
+		kept := b.state.PendingDecisions[:0]
+		pruned := 0
+		for _, d := range b.state.PendingDecisions {
+			if openSet[fmt.Sprintf("%s#%d", d.Repo, d.Number)] {
+				kept = append(kept, d)
+			} else {
+				pruned++
+			}
+		}
+		if pruned > 0 {
+			b.state.PendingDecisions = kept
+			writeJSONAtomic(b.statePath, b.state)
+		}
+	}
 	b.mu.Unlock()
 
 	b.log(fmt.Sprintf("扫描完成：Open PR %d 个，新增待审任务 %d 条", len(foundPRs), added))
