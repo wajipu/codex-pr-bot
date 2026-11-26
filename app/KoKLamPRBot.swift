@@ -2437,94 +2437,109 @@ struct MainStreamWindowView: View {
     // MARK: - Top Bar (Orca centered pill + clean controls)
 
     private var topBar: some View {
-        ZStack {
-            // Centered Orca-style pill
+        HStack(spacing: 8) {
+            // Left: Logo + title + live status dot
             HStack(spacing: 7) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
                     .interpolation(.high)
-                    .frame(width: 18, height: 18)
-                    .clipShape(Circle())
+                    .frame(width: 19, height: 19)
+                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                 Text("PR 评审")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.92))
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.95))
+                    .lineLimit(1)
+                    .fixedSize()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
-            .background(Color.white.opacity(0.07), in: Capsule())
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.10), lineWidth: 0.7))
 
-            HStack(spacing: 10) {
-                // Left: status + Open PR button + token badge
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(statusDotColor)
-                        .frame(width: 7, height: 7)
-                    Text(statusShortText)
-                        .font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.75))
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(statusDotColor)
+                    .frame(width: 6.5, height: 6.5)
+                Text(statusShortText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.06), in: Capsule())
+
+            Button {
+                showOpenPRsSheet = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.pull")
+                        .font(.system(size: 10))
+                    Text("Open PR (\(store.openPRs.count))")
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                        .fixedSize()
                 }
+                .foregroundStyle(.white.opacity(0.86))
                 .padding(.horizontal, 9)
                 .padding(.vertical, 4)
-                .background(Color.white.opacity(0.05), in: Capsule())
+                .background(Color.white.opacity(0.06), in: Capsule())
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.09), lineWidth: 0.7))
+            }
+            .buttonStyle(.plain)
 
+            Spacer(minLength: 8)
+
+            // Right: concise primary controls + overflow menu
+            if let latest = store.latestVersion {
                 Button {
-                    showOpenPRsSheet = true
+                    store.openUpdateOrCheck()
                 } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "arrow.triangle.pull")
-                            .font(.system(size: 10.5))
-                        Text("Open PR (\(store.openPRs.count))")
-                            .font(.system(size: 11.5, weight: .medium))
-                    }
-                    .foregroundStyle(.white.opacity(0.85))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color.white.opacity(0.06), in: Capsule())
-                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.09), lineWidth: 0.7))
+                    Text("↑ \(latest)")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.green)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.15), in: Capsule())
                 }
                 .buttonStyle(.plain)
-
-                if let today = store.todayUsage, today.netTokens > 0 {
-                    Text("今日 \(formatTokens(today.netTokens))")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.45))
-                }
-
-                Spacer()
-
-                // Right: compact icon actions
-                if let latest = store.latestVersion {
-                    Button {
-                        store.openUpdateOrCheck()
-                    } label: {
-                        Text("↑ \(latest)")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.green)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.green.opacity(0.15), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                iconBtn("terminal", help: "运行日志") { showLogsSheet = true }
-                iconBtn("bell", help: "测试系统通知") { store.sendTestNotification() }
-                iconBtn("arrow.clockwise", help: "立即扫描") { store.triggerScan() }
-                iconBtn(store.paused ? "play.fill" : "pause.fill", help: store.paused ? "恢复轮询" : "暂停轮询") {
-                    store.togglePause()
-                }
-                iconBtn("gearshape", help: "设置") { showSettings = true }
-                if let popOut = onPopOut {
-                    iconBtn("arrow.up.left.and.arrow.down.right", help: "弹出独立大窗口") { popOut() }
-                }
-                if isPopover {
-                    iconBtn("power", help: "退出 KoKLam PR Bot") { NSApp.terminate(nil) }
-                }
             }
-            .padding(.horizontal, isPopover ? 12 : 18)
+
+            iconBtn("arrow.clockwise", help: "立即扫描") { store.triggerScan() }
+            iconBtn(store.paused ? "play.fill" : "pause.fill", help: store.paused ? "恢复轮询" : "暂停轮询") {
+                store.togglePause()
+            }
+            iconBtn("gearshape", help: "设置") { showSettings = true }
+
+            Menu {
+                Button { showLogsSheet = true } label: {
+                    Label("查看运行日志", systemImage: "terminal")
+                }
+                Button { store.sendTestNotification() } label: {
+                    Label("发送测试通知", systemImage: "bell")
+                }
+                if let popOut = onPopOut {
+                    Button { popOut() } label: {
+                        Label("弹出独立大窗口", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                }
+                Divider()
+                Button(role: .destructive) { NSApp.terminate(nil) } label: {
+                    Label("退出 KoKLam PR Bot", systemImage: "power")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .frame(width: 26, height: 26)
+                    .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 26, height: 26)
+            .help("更多")
         }
-        .frame(height: 48)
+        .padding(.horizontal, isPopover ? 14 : 18)
+        .frame(height: 46)
     }
 
     private func iconBtn(_ name: String, help: String, action: @escaping () -> Void) -> some View {
@@ -3012,7 +3027,7 @@ struct MainStreamWindowView: View {
 
     private var bottomComposer: some View {
         VStack(spacing: 8) {
-            // Quick prompt chips
+            // Quick prompt chips + today token usage
             HStack(spacing: 8) {
                 quickChip("open 都看下吧")
                 quickChip("扫描新 PR")
@@ -3020,6 +3035,11 @@ struct MainStreamWindowView: View {
                     quickChip("授权新开会话修复 #\(firstDec.number)")
                 }
                 Spacer()
+                if let today = store.todayUsage, today.netTokens > 0 {
+                    Text("今日 \(formatTokens(today.netTokens))")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
             }
             .frame(maxWidth: 780)
 
