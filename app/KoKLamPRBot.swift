@@ -2738,6 +2738,9 @@ struct MainStreamWindowView: View {
 
     private func activeTaskRow(_ t: ActiveTask) -> some View {
         let isExp = expandedIDs.contains("act-\(t.id)")
+        let isFix = t.id.hasPrefix("fix|") || t.stage.contains("修复")
+        let roleLabel = isFix ? "PR 修复" : "PR 评审"
+        let accent: Color = isFix ? .blue : .orange
         return VStack(alignment: .leading, spacing: 6) {
             Button {
                 toggleExpand("act-\(t.id)")
@@ -2746,66 +2749,71 @@ struct MainStreamWindowView: View {
                     ProgressView()
                         .controlSize(.mini)
                         .scaleEffect(0.75)
-                    Text("Started")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.white.opacity(0.5))
-                    Text("PR 评审")
+                    Text(isFix ? "Fixing" : "Started")
+                        .font(.system(size: 12))
+                        .foregroundStyle(accent.opacity(0.9))
+                    Text(roleLabel)
                         .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.9))
-                    Text("\(t.displayRepo)#\(t.number) · \(t.stage) (\(formatDuration(t.elapsed_sec)))")
+                        .foregroundStyle(.white.opacity(0.92))
+                    Text("\(t.displayRepo)#\(t.number) · \(t.stage)")
                         .font(.system(size: 12.5))
-                        .foregroundStyle(.white.opacity(0.62))
+                        .foregroundStyle(.white.opacity(0.68))
                         .lineLimit(1)
                     Image(systemName: isExp ? "chevron.down" : "chevron.right")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.white.opacity(0.4))
                     Spacer()
+                    Text(formatDuration(t.elapsed_sec))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.45))
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
-            if isExp {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(t.title)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.88))
-                    if let steps = t.steps, !steps.isEmpty {
-                        HStack(spacing: 8) {
-                            ForEach(Array(steps.enumerated()), id: \.offset) { _, st in
-                                HStack(spacing: 4) {
-                                    Circle()
-                                        .fill(st.status == "done" ? Color.green : (st.status == "running" ? Color.orange : Color.red))
-                                        .frame(width: 5.5, height: 5.5)
-                                    Text(st.name)
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.white.opacity(0.75))
+            // Always-visible compact progress strip (step pills + latest live line)
+            VStack(alignment: .leading, spacing: 6) {
+                if let steps = t.steps, !steps.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(Array(steps.enumerated()), id: \.offset) { _, st in
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(st.status == "done" ? Color.green : (st.status == "running" ? accent : Color.red))
+                                    .frame(width: 5.5, height: 5.5)
+                                Text(st.name)
+                                    .font(.system(size: 10.5, weight: st.status == "running" ? .semibold : .regular))
+                                    .foregroundStyle(.white.opacity(st.status == "running" ? 0.92 : 0.62))
+                                if st.status == "running" && !st.detail.isEmpty {
+                                    Text("· \(st.detail)")
+                                        .font(.system(size: 10.5))
+                                        .foregroundStyle(.white.opacity(0.5))
+                                        .lineLimit(1)
                                 }
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3)
-                                .background(Color.white.opacity(0.05), in: Capsule())
                             }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.white.opacity(st.status == "running" ? 0.09 : 0.04), in: Capsule())
                         }
-                    }
-                    if let lines = t.live_lines, !lines.isEmpty {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(lines.suffix(12).enumerated()), id: \.offset) { _, line in
-                                Text(line)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.62))
-                                    .lineLimit(2)
-                            }
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8))
                     }
                 }
-                .padding(12)
-                .background(cardColor, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.white.opacity(0.07), lineWidth: 0.7))
-                .padding(.leading, 20)
+
+                if let lines = t.live_lines, !lines.isEmpty {
+                    let displayLines = isExp ? Array(lines.suffix(18)) : Array(lines.suffix(2))
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(displayLines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.white.opacity(isExp ? 0.72 : 0.55))
+                                .lineLimit(isExp ? 3 : 1)
+                        }
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 7))
+                }
             }
+            .padding(.leading, 20)
         }
     }
 
@@ -3027,6 +3035,29 @@ struct MainStreamWindowView: View {
 
     private var bottomComposer: some View {
         VStack(spacing: 8) {
+            // Orca-style live floating status pill when any Review / Fix task is running
+            if let active = store.activeTasks.first {
+                let isFix = active.id.hasPrefix("fix|") || active.stage.contains("修复")
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(isFix ? Color.yellow : Color.orange)
+                        .frame(width: 6.5, height: 6.5)
+                    Text("\(isFix ? "续接 Agent 修复" : "正在评审") \(active.displayRepo)#\(active.number) · \(active.stage)")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.82))
+                        .lineLimit(1)
+                    if store.activeTasks.count > 1 {
+                        Text("+\(store.activeTasks.count - 1)")
+                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.yellow)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.07), in: Capsule())
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.11), lineWidth: 0.7))
+            }
+
             // Quick prompt chips + today token usage
             HStack(spacing: 8) {
                 quickChip("open 都看下吧")
