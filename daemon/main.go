@@ -30,7 +30,7 @@ import (
 const botHeader = "### 🤖 Codex CLI Review"
 
 var (
-	triggerRe  = regexp.MustCompile(`(?i)(?:^|\s)[/@]codex\s+review\b`)
+	triggerRe  = regexp.MustCompile(`(?i)(?:^|\s)(?:[/@]koklam-pr-bot(?:\[bot\])?(?:\s|$|[,.:;!?，。：；！？])|[/@]codex\s+review\b)`)
 	sessionRe  = regexp.MustCompile(`(?i)(?:<!--\s*agent-session\s*:\s*|agent-session\s*:\s*)(claude|codex|agy|pi|opencode|[a-z0-9_-]+)\s*:\s*([A-Za-z0-9_./-]+)`)
 	noSquashRe = regexp.MustCompile(`(?i)(勿\s*squash|不要\s*squash|保留提交|no\s*squash|use\s+merge\s+commit)`)
 	noMergeRe  = regexp.MustCompile(`(?i)(勿自动合并|不要自动合并|do\s+not\s+auto[\s-]?merge|\[wip\])`)
@@ -41,6 +41,23 @@ var (
 		"claude": true, "codex": true, "agy": true, "pi": true, "opencode": true,
 	}
 )
+
+func matchCommentTrigger(body string, cfg Config) bool {
+	if triggerRe.MatchString(body) {
+		return true
+	}
+	lower := strings.ToLower(body)
+	for _, m := range cfg.TriggerMentions {
+		m = strings.TrimSpace(strings.TrimLeft(strings.ToLower(m), "@/"))
+		if m == "" {
+			continue
+		}
+		if strings.Contains(lower, "@"+m) || strings.Contains(lower, "/"+m) {
+			return true
+		}
+	}
+	return false
+}
 
 // MARK: - Config & State
 
@@ -61,6 +78,7 @@ type Config struct {
 	SkipDraft            *bool                      `json:"skip_draft"`
 	GitHubAppID          string                     `json:"github_app_id"`
 	GitHubAppPrivateKey  string                     `json:"github_app_private_key"`
+	TriggerMentions      []string                   `json:"trigger_mentions"`
 	FallbackFixer        string                     `json:"fallback_fixer"`
 	MaxFixRounds         int                        `json:"max_fix_rounds"`
 	IgnoreBranchPrefixes []string                   `json:"ignore_branch_prefixes"`
@@ -334,9 +352,20 @@ type Bot struct {
 
 func newBot() *Bot {
 	home, _ := os.UserHomeDir()
-	dataDir := os.Getenv("CODEX_PR_BOT_HOME")
+	dataDir := os.Getenv("KOKLAM_PR_BOT_HOME")
 	if dataDir == "" {
-		dataDir = filepath.Join(home, ".codex-pr-bot")
+		dataDir = os.Getenv("CODEX_PR_BOT_HOME")
+	}
+	if dataDir == "" {
+		primary := filepath.Join(home, ".koklam-pr-bot")
+		legacy := filepath.Join(home, ".codex-pr-bot")
+		if _, err := os.Stat(primary); err == nil {
+			dataDir = primary
+		} else if _, err := os.Stat(legacy); err == nil {
+			dataDir = legacy
+		} else {
+			dataDir = primary
+		}
 	}
 	_ = os.MkdirAll(dataDir, 0o755)
 
@@ -1080,10 +1109,13 @@ func (b *Bot) scanOnce() int {
 				var latestCmd *GHComment
 				for i := range pr.Comments {
 					c := &pr.Comments[i]
-					if strings.Contains(c.Body, botHeader) {
+					if strings.Contains(c.Body, botHeader) || strings.Contains(c.Body, "⏳ **Working...**") {
 						continue
 					}
-					if triggerRe.MatchString(c.Body) {
+					if strings.HasSuffix(strings.ToLower(c.Author.Login), "[bot]") {
+						continue
+					}
+					if matchCommentTrigger(c.Body, cfg) {
 						latestCmd = c
 					}
 				}
@@ -2534,10 +2566,10 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "service": "codex-pr-botd-go"})
+		writeJSON(w, 200, map[string]any{"ok": true, "service": "koklam-pr-botd"})
 	})
 
-	bot.log(fmt.Sprintf("Codex PR Bot (Go) 后台服务已启动（并发=%d，自动派修=%v，自动合并=%v，IPC=127.0.0.1:%d）",
+	bot.log(fmt.Sprintf("KoKLam PR Bot (Go) 后台服务已启动（并发=%d，自动派修=%v，自动合并=%v，IPC=127.0.0.1:%d）",
 		conc, boolDefault(bot.cfg.AutoFix, true), boolDefault(bot.cfg.AutoMerge, true), port))
 
 	srv := &http.Server{

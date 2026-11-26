@@ -242,7 +242,7 @@ enum PopoverTab: String, CaseIterable, Identifiable {
 
 @MainActor
 final class BotStore: ObservableObject {
-    static let githubRepo = "wajipu/codex-pr-bot"
+    static let githubRepo = "wajipu/koklam-pr-bot"
     static let currentVersion: String =
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.0.0"
 
@@ -390,11 +390,11 @@ final class BotStore: ObservableObject {
 
     func sendTestNotification() {
         NotificationDelegate.shared.send(
-            title: "✅ Codex PR Bot 通知正常",
+            title: "✅ KoKLam PR Bot 通知正常",
             subtitle: "原生 macOS 通知已启用",
             body: "PR 审查通过、自动派修或合并后都会在这里弹窗提醒"
         )
-        showToast("已发送测试通知（如未弹出请在系统设置→通知开启 Codex PR Bot）")
+        showToast("已发送测试通知（如未弹出请在系统设置→通知开启 KoKLam PR Bot）")
     }
 
     func refreshNow() {
@@ -755,7 +755,7 @@ struct PopoverView: View {
             Image(systemName: "sparkles.rectangle.stack.fill")
                 .font(.system(size: 16))
                 .foregroundStyle(.cyan)
-            Text("Codex PR Bot")
+            Text("KoKLam PR Bot")
                 .font(.system(size: 14.5, weight: .bold))
 
             statusPill
@@ -1926,7 +1926,7 @@ struct SettingsSheetView: View {
                                         .textFieldStyle(.roundedBorder)
                                         .font(.system(size: 11.5, design: .monospaced))
                                         .frame(width: 100)
-                                    TextField("私钥路径（如 ~/.codex-pr-bot/app.pem）", text: $appKeyPathText)
+                                    TextField("私钥路径（如 ~/.koklam-pr-bot/app.pem）", text: $appKeyPathText)
                                         .textFieldStyle(.roundedBorder)
                                         .font(.system(size: 11.5, design: .monospaced))
                                 }

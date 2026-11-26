@@ -1,14 +1,14 @@
-# Codex PR Bot
+# KoKLam PR Bot
 
 轻量级、零外部依赖的 **本地 Codex CLI GitHub PR 自动审查机器人 + macOS 原生菜单栏桌面端**。
 
-直接复用你本机登录好的 `codex` CLI 与 `gh` CLI，不需要公网服务器、不需要额外购买 OpenAI API Key，支持多并发并行 Review 与 macOS 系统通知。
+直接复用你本机登录好的 `codex` CLI 与 `gh` CLI，不需要公网服务器、不需要额外购买 OpenAI API Key，支持多并发并行 Review、GitHub App `[Bot]` 身份评论与 macOS 系统通知。
 
 ## 核心特性
 
 - **双触发模式**：
   - **自动审查**：监听目标仓库的 Open PR，有新 PR 或推送新 Commit 时自动触发（按 `PR + commit SHA` 去重）。
-  - **评论随时呼唤**：在任意 PR 评论区回复 `/codex review` 或 `@codex review`（可附额外关注点，如 `@codex review 重点看并发和事务`），按评论 ID 去重。
+  - **评论随时呼唤**：在任意 PR 评论区直接 **`@koklam-pr-bot`**（可附额外关注点，如 `@koklam-pr-bot 重点看并发和事务`，也兼容 `@codex review` / `/codex review` 及自定义 `trigger_mentions`），按评论 ID 去重。
 - **原生 macOS 菜单栏下拉面板（SwiftUI）**：
   - 顶部菜单栏常驻，审查时实时显示并发进度（如 `⚡ 2/3`）。
   - 下拉毛玻璃面板查看 Open PR、正在并行 Review 的 Worker 实时输出、历史记录与运行日志。
@@ -28,12 +28,12 @@
 ## 一键安装 / 更新
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wajipu/codex-pr-bot/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/wajipu/koklam-pr-bot/main/scripts/install.sh | bash
 ```
 
-安装完成后编辑 `~/.codex-pr-bot/config.json`，把 `repos` 改成你要监听的 GitHub 仓库（可选填 `local_repo_map` 让 Codex 读取本地仓库的 `AGENTS.md`）。
+安装完成后编辑 `~/.koklam-pr-bot/config.json`，把 `repos` 改成你要监听的 GitHub 仓库（可选填 `local_repo_map` 让 Codex 读取本地仓库的 `AGENTS.md`）。
 
-## 配置示例 (`~/.codex-pr-bot/config.json`)
+## 配置示例 (`~/.koklam-pr-bot/config.json`)
 
 ```json
 {
