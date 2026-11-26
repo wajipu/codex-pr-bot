@@ -1215,10 +1215,24 @@ func (b *Bot) bindSession(repo string, number int, agent, sessionID string) {
 }
 
 func (b *Bot) enqueueJob(job reviewJob) bool {
+	sha8 := shaPrefix(job.PR.HeadRefOid)
 	b.mu.Lock()
 	if b.enqueuedKeys[job.StateKey] {
 		b.mu.Unlock()
 		return false
+	}
+	// Deduplicate across all trigger sources (auto / chat / comment / MCP) for the same PR + commit SHA
+	for _, cur := range b.activeTasks {
+		if !strings.HasPrefix(cur.ID, "fix|") && strings.EqualFold(cur.Repo, job.Repo) && cur.Number == job.PR.Number && cur.Sha8 == sha8 {
+			b.mu.Unlock()
+			return false
+		}
+	}
+	for _, q := range b.pendingQueue {
+		if strings.EqualFold(q.Repo, job.Repo) && q.Number == job.PR.Number && q.Sha8 == sha8 {
+			b.mu.Unlock()
+			return false
+		}
 	}
 	b.enqueuedKeys[job.StateKey] = true
 	b.pendingQueue = append(b.pendingQueue, QueuedTask{
@@ -1228,7 +1242,7 @@ func (b *Bot) enqueueJob(job reviewJob) bool {
 		Number:      job.PR.Number,
 		Title:       job.PR.Title,
 		URL:         job.PR.URL,
-		Sha8:        shaPrefix(job.PR.HeadRefOid),
+		Sha8:        sha8,
 		TriggerInfo: job.TriggerInfo,
 		StateKey:    job.StateKey,
 	})
