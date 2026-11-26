@@ -216,7 +216,10 @@ struct BotConfigPayload: Codable, Equatable, Sendable {
     var auto_fix: Bool
     var auto_merge: Bool
     var fallback_new_session: Bool
+    var live_status_comment: Bool?
     var skip_draft: Bool
+    var github_app_id: String?
+    var github_app_private_key: String?
     var fallback_fixer: String
     var max_fix_rounds: Int
     var reasoning_effort: String
@@ -1795,6 +1798,9 @@ struct SettingsSheetView: View {
     @State private var newRepo = ""
     @State private var newRepoPath = ""
     @State private var allowText = ""
+    @State private var appIDText = ""
+    @State private var appKeyPathText = ""
+    @State private var liveCommentOn = true
     @State private var saving = false
 
     private let efforts = ["low", "medium", "high", "max"]
@@ -1832,6 +1838,7 @@ struct SettingsSheetView: View {
                             Toggle("审查不通过时自动派回原会话修复", isOn: c.auto_fix)
                             Toggle("原会话不可恢复时允许新开会话", isOn: c.fallback_new_session)
                             Toggle("审查通过自动合并 PR", isOn: c.auto_merge)
+                            Toggle("开审先发 Working 占位评论并原地更新", isOn: $liveCommentOn)
                             Toggle("跳过草稿 PR (Draft)", isOn: c.skip_draft)
                         }
                         .toggleStyle(.switch)
@@ -1909,6 +1916,21 @@ struct SettingsSheetView: View {
                                     .textFieldStyle(.roundedBorder)
                                     .font(.system(size: 11.5, design: .monospaced))
                             }
+
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("GitHub App [Bot] 身份（可选，填了就显示专属 Bot 头像和标签）")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 6) {
+                                    TextField("App ID", text: $appIDText)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(size: 11.5, design: .monospaced))
+                                        .frame(width: 100)
+                                    TextField("私钥路径（如 ~/.codex-pr-bot/app.pem）", text: $appKeyPathText)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(size: 11.5, design: .monospaced))
+                                }
+                            }
                         }
 
                         Divider().opacity(0.25)
@@ -1985,6 +2007,9 @@ struct SettingsSheetView: View {
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
                     current.allowed_commenters = parsed
+                    current.live_status_comment = liveCommentOn
+                    current.github_app_id = appIDText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    current.github_app_private_key = appKeyPathText.trimmingCharacters(in: .whitespacesAndNewlines)
                     saving = true
                     Task {
                         _ = await store.saveConfig(current)
@@ -1999,11 +2024,14 @@ struct SettingsSheetView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
-        .frame(width: 400, height: 520)
+        .frame(width: 400, height: 540)
         .task {
             let loaded = await store.fetchConfig()
             cfg = loaded
             allowText = (loaded?.allowed_commenters ?? []).joined(separator: ", ")
+            liveCommentOn = loaded?.live_status_comment ?? true
+            appIDText = loaded?.github_app_id ?? ""
+            appKeyPathText = loaded?.github_app_private_key ?? ""
         }
     }
 }

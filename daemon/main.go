@@ -4,7 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,7 +57,10 @@ type Config struct {
 	AutoFix              *bool                      `json:"auto_fix"`
 	AutoMerge            *bool                      `json:"auto_merge"`
 	FallbackNewSession   *bool                      `json:"fallback_new_session"`
+	LiveStatusComment    *bool                      `json:"live_status_comment"`
 	SkipDraft            *bool                      `json:"skip_draft"`
+	GitHubAppID          string                     `json:"github_app_id"`
+	GitHubAppPrivateKey  string                     `json:"github_app_private_key"`
 	FallbackFixer        string                     `json:"fallback_fixer"`
 	MaxFixRounds         int                        `json:"max_fix_rounds"`
 	IgnoreBranchPrefixes []string                   `json:"ignore_branch_prefixes"`
@@ -291,6 +301,11 @@ type reviewJob struct {
 
 // MARK: - Bot Runtime
 
+type cachedInstallToken struct {
+	Token     string
+	ExpiresAt time.Time
+}
+
 type Bot struct {
 	mu           sync.Mutex
 	dataDir      string
@@ -311,6 +326,7 @@ type Bot struct {
 	lastScanAt    *string
 	nextScanTime  time.Time
 	enqueuedKeys  map[string]bool
+	appTokens     map[string]cachedInstallToken
 
 	wakeScan chan struct{}
 	jobCh    chan reviewJob
@@ -332,6 +348,7 @@ func newBot() *Bot {
 		historyPath:  filepath.Join(dataDir, "history.json"),
 		activeTasks:  make(map[string]*ActiveTask),
 		enqueuedKeys: make(map[string]bool),
+		appTokens:    make(map[string]cachedInstallToken),
 		nextScanTime: time.Now().Add(3 * time.Second),
 		wakeScan:     make(chan struct{}, 1),
 		jobCh:        make(chan reviewJob, 128),
@@ -462,6 +479,175 @@ func (b *Bot) loadHistory() {
 	if b.history == nil {
 		b.history = []HistoryItem{}
 	}
+}
+
+// MARK: - GitHub App [Bot] Auth & Live Comment Create/Edit (stdlib RS256 JWT)
+
+func signGitHubAppJWT(appID, keyPath string) (string, error) {
+	raw, err := os.ReadFile(expandHome(keyPath))
+	if err != nil {
+		return "", err
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return "", fmt.Errorf("invalid PEM private key")
+	}
+	var priv *rsa.PrivateKey
+	if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		priv = k
+	} else if k2, err2 := x509.ParsePKCS8PrivateKey(block.Bytes); err2 == nil {
+		rk, ok := k2.(*rsa.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("private key is not RSA")
+		}
+		priv = rk
+	} else {
+		return "", fmt.Errorf("failed to parse RSA private key: %v", err)
+	}
+
+	now := time.Now().Unix()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	payloadJSON := fmt.Sprintf(`{"iat":%d,"exp":%d,"iss":"%s"}`, now-60, now+540, strings.TrimSpace(appID))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(payloadJSON))
+	signingInput := header + "." + payload
+	sum := sha256.Sum256([]byte(signingInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, sum[:])
+	if err != nil {
+		return "", err
+	}
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+func (b *Bot) githubAppToken(cfg Config, repo string) (string, error) {
+	appID := strings.TrimSpace(cfg.GitHubAppID)
+	keyPath := strings.TrimSpace(cfg.GitHubAppPrivateKey)
+	if appID == "" || keyPath == "" {
+		return "", nil
+	}
+	b.mu.Lock()
+	if cached, ok := b.appTokens[repo]; ok && time.Now().Before(cached.ExpiresAt) {
+		b.mu.Unlock()
+		return cached.Token, nil
+	}
+	b.mu.Unlock()
+
+	jwt, err := signGitHubAppJWT(appID, keyPath)
+	if err != nil {
+		return "", err
+	}
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	// 1) Look up installation id for this repo
+	req1, _ := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/repos/%s/installation", repo), nil)
+	req1.Header.Set("Authorization", "Bearer "+jwt)
+	req1.Header.Set("Accept", "application/vnd.github+json")
+	req1.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		return "", err
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != 200 {
+		body, _ := io.ReadAll(resp1.Body)
+		return "", fmt.Errorf("installation lookup HTTP %d: %s", resp1.StatusCode, truncate(string(body), 140))
+	}
+	var inst struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp1.Body).Decode(&inst); err != nil || inst.ID == 0 {
+		return "", fmt.Errorf("invalid installation response")
+	}
+
+	// 2) Mint installation access token
+	req2, _ := http.NewRequest("POST", fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", inst.ID), nil)
+	req2.Header.Set("Authorization", "Bearer "+jwt)
+	req2.Header.Set("Accept", "application/vnd.github+json")
+	req2.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		return "", err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 201 {
+		body, _ := io.ReadAll(resp2.Body)
+		return "", fmt.Errorf("access_token HTTP %d: %s", resp2.StatusCode, truncate(string(body), 140))
+	}
+	var tok struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&tok); err != nil || tok.Token == "" {
+		return "", fmt.Errorf("invalid installation token")
+	}
+
+	b.mu.Lock()
+	b.appTokens[repo] = cachedInstallToken{Token: tok.Token, ExpiresAt: time.Now().Add(45 * time.Minute)}
+	b.mu.Unlock()
+	return tok.Token, nil
+}
+
+func (b *Bot) postPRComment(cfg Config, gh, repo string, number int, body string) (int64, error) {
+	if tok, err := b.githubAppToken(cfg, repo); err == nil && tok != "" {
+		payload, _ := json.Marshal(map[string]string{"body": body})
+		req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.github.com/repos/%s/issues/%d/comments", repo, number), bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == 201 {
+				var out struct{ ID int64 `json:"id"` }
+				_ = json.NewDecoder(resp.Body).Decode(&out)
+				return out.ID, nil
+			}
+		}
+		b.log(fmt.Sprintf("⚠️ GitHub App 发评失败，降级使用 gh CLI"))
+	} else if err != nil {
+		b.log(fmt.Sprintf("⚠️ GitHub App 鉴权失败（%v），降级使用 gh CLI", err))
+	}
+
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	stdout, stderr, err := runCmd(ctx, "", string(payload), gh, "api",
+		fmt.Sprintf("repos/%s/issues/%d/comments", repo, number),
+		"--method", "POST", "--input", "-")
+	if err != nil {
+		return 0, fmt.Errorf("gh api comment 失败: %s", truncate(strings.TrimSpace(stderr), 180))
+	}
+	var out struct{ ID int64 `json:"id"` }
+	_ = json.Unmarshal([]byte(stdout), &out)
+	return out.ID, nil
+}
+
+func (b *Bot) editPRComment(cfg Config, gh, repo string, commentID int64, body string) error {
+	if tok, err := b.githubAppToken(cfg, repo); err == nil && tok != "" {
+		payload, _ := json.Marshal(map[string]string{"body": body})
+		req, _ := http.NewRequest("PATCH", fmt.Sprintf("https://api.github.com/repos/%s/issues/comments/%d", repo, commentID), bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return nil
+			}
+		}
+	}
+
+	payload, _ := json.Marshal(map[string]string{"body": body})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, stderr, err := runCmd(ctx, "", string(payload), gh, "api",
+		fmt.Sprintf("repos/%s/issues/comments/%d", repo, commentID),
+		"--method", "PATCH", "--input", "-")
+	if err != nil {
+		return fmt.Errorf("gh api edit comment 失败: %s", truncate(strings.TrimSpace(stderr), 180))
+	}
+	return nil
 }
 
 func runCmd(ctx context.Context, cwd, stdinText string, name string, args ...string) (string, string, error) {
@@ -1577,8 +1763,17 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	fixNote := ""
 	fixerAgent := ""
 	var totalJobUsage TokenUsage
+	var liveCommentID int64
 
 	func() {
+		if boolDefault(cfg.LiveStatusComment, true) {
+			initBody := fmt.Sprintf("%s (`%s`)\n\n⏳ **Working** · 正在拉取 PR Diff 并启动本机 Codex CLI 只读审查，完成后将原地更新本条评论...\n\n<sub>触发：%s</sub>\n%s\n",
+				botHeader, sha8, job.TriggerInfo, job.Marker)
+			if cid, err := b.postPRComment(cfg, gh, repo, pr.Number, initBody); err == nil && cid > 0 {
+				liveCommentID = cid
+			}
+		}
+
 		startStep("拉取 Diff", "拉取 PR Diff...")
 		ctxDiff, cancelDiff := context.WithTimeout(context.Background(), 60*time.Second)
 		diffText, stderr, err := runCmd(ctxDiff, "", "", gh, "pr", "diff", strconv.Itoa(pr.Number), "--repo", repo)
@@ -1648,15 +1843,18 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		startStep("回写评论", "回写 GitHub PR 评论...")
 		commentBody := fmt.Sprintf("%s (`%s`)\n\n%s\n\n<sub>触发：%s</sub>\n%s\n",
 			botHeader, sha8, reviewBody, job.TriggerInfo, job.Marker)
-		ctxPost, cancelPost := context.WithTimeout(context.Background(), 60*time.Second)
-		_, stderr, err = runCmd(ctxPost, "", commentBody, gh, "pr", "comment", strconv.Itoa(pr.Number), "--repo", repo, "--body-file", "-")
-		cancelPost()
-		if err != nil {
-			errorMsg = "gh pr comment 失败: " + truncate(strings.TrimSpace(stderr), 180)
+		var postErr error
+		if liveCommentID > 0 {
+			postErr = b.editPRComment(cfg, gh, repo, liveCommentID, commentBody)
+		} else {
+			_, postErr = b.postPRComment(cfg, gh, repo, pr.Number, commentBody)
+		}
+		if postErr != nil {
+			errorMsg = postErr.Error()
 			finishStep("failed", errorMsg)
 			return
 		}
-		finishStep("done", "已评论到 PR")
+		finishStep("done", "已更新到 PR 评论")
 
 		ok = true
 		b.log(fmt.Sprintf("[Worker #%d] 审查完成 %s#%d -> %s", workerID, short, pr.Number, verdict))
@@ -1742,6 +1940,11 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 
 	if !ok {
 		b.log(fmt.Sprintf("[Worker #%d] ❌ 审查失败 %s#%d: %s", workerID, short, pr.Number, errorMsg))
+		if liveCommentID > 0 {
+			failBody := fmt.Sprintf("%s (`%s`)\n\n❌ **审查未能完成**：%s\n\n<sub>触发：%s</sub>\n",
+				botHeader, sha8, errorMsg, job.TriggerInfo)
+			_ = b.editPRComment(cfg, gh, repo, liveCommentID, failBody)
+		}
 	}
 
 	duration := int(time.Since(started).Seconds())
@@ -2231,10 +2434,13 @@ func main() {
 				"auto_review":           boolDefault(cfg.AutoReview, true),
 				"comment_trigger":       boolDefault(cfg.CommentTrigger, true),
 				"auto_fix":              boolDefault(cfg.AutoFix, true),
-				"auto_merge":            boolDefault(cfg.AutoMerge, true),
-				"fallback_new_session":  boolDefault(cfg.FallbackNewSession, false),
-				"skip_draft":            boolDefault(cfg.SkipDraft, true),
-				"fallback_fixer":        cfg.FallbackFixer,
+				"auto_merge":             boolDefault(cfg.AutoMerge, true),
+				"fallback_new_session":   boolDefault(cfg.FallbackNewSession, false),
+				"live_status_comment":    boolDefault(cfg.LiveStatusComment, true),
+				"skip_draft":             boolDefault(cfg.SkipDraft, true),
+				"github_app_id":          cfg.GitHubAppID,
+				"github_app_private_key": cfg.GitHubAppPrivateKey,
+				"fallback_fixer":         cfg.FallbackFixer,
 				"max_fix_rounds":        intDefault(cfg.MaxFixRounds, 2),
 				"reasoning_effort":      cfg.ReasoningEffort,
 				"poll_interval_seconds": intDefault(cfg.PollIntervalSeconds, 120),
@@ -2251,7 +2457,10 @@ func main() {
 				AutoFix             *bool              `json:"auto_fix"`
 				AutoMerge           *bool              `json:"auto_merge"`
 				FallbackNewSession  *bool              `json:"fallback_new_session"`
+				LiveStatusComment   *bool              `json:"live_status_comment"`
 				SkipDraft           *bool              `json:"skip_draft"`
+				GitHubAppID         *string            `json:"github_app_id"`
+				GitHubAppPrivateKey *string            `json:"github_app_private_key"`
 				FallbackFixer       *string            `json:"fallback_fixer"`
 				MaxFixRounds        *int               `json:"max_fix_rounds"`
 				ReasoningEffort     *string            `json:"reasoning_effort"`
@@ -2287,8 +2496,17 @@ func main() {
 			if patch.FallbackNewSession != nil {
 				cfg.FallbackNewSession = patch.FallbackNewSession
 			}
+			if patch.LiveStatusComment != nil {
+				cfg.LiveStatusComment = patch.LiveStatusComment
+			}
 			if patch.SkipDraft != nil {
 				cfg.SkipDraft = patch.SkipDraft
+			}
+			if patch.GitHubAppID != nil {
+				cfg.GitHubAppID = strings.TrimSpace(*patch.GitHubAppID)
+			}
+			if patch.GitHubAppPrivateKey != nil {
+				cfg.GitHubAppPrivateKey = strings.TrimSpace(*patch.GitHubAppPrivateKey)
 			}
 			if patch.FallbackFixer != nil {
 				cfg.FallbackFixer = strings.TrimSpace(*patch.FallbackFixer)
