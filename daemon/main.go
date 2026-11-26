@@ -125,14 +125,29 @@ type DecisionItem struct {
 	AgentSession *string `json:"agent_session,omitempty"`
 }
 
+type ResolvedDecision struct {
+	ID         string `json:"id"`
+	ResolvedAt string `json:"resolved_at"`
+	Repo       string `json:"repo"`
+	ShortRepo  string `json:"short_repo"`
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	URL        string `json:"url"`
+	Question   string `json:"question"`
+	ReplyText  string `json:"reply_text"`
+	Action     string `json:"action"` // authorize_fix | merge | dismiss
+	ResultNote string `json:"result_note"`
+}
+
 type State struct {
-	SeenAuto         map[string]string         `json:"seen_auto"`
-	SeenCmd          map[string]string         `json:"seen_cmd"`
-	FixRounds        map[string]int            `json:"fix_rounds"`
-	SessionBindings  map[string]SessionBinding `json:"session_bindings"`
-	TotalUsage       TokenUsage                `json:"total_usage"`
-	DailyUsage       map[string]TokenUsage     `json:"daily_usage"`
-	PendingDecisions []DecisionItem            `json:"pending_decisions"`
+	SeenAuto          map[string]string         `json:"seen_auto"`
+	SeenCmd           map[string]string         `json:"seen_cmd"`
+	FixRounds         map[string]int            `json:"fix_rounds"`
+	SessionBindings   map[string]SessionBinding `json:"session_bindings"`
+	TotalUsage        TokenUsage                `json:"total_usage"`
+	DailyUsage        map[string]TokenUsage     `json:"daily_usage"`
+	PendingDecisions  []DecisionItem            `json:"pending_decisions"`
+	ResolvedDecisions []ResolvedDecision        `json:"resolved_decisions"`
 }
 
 // MARK: - GitHub PR JSON
@@ -260,9 +275,10 @@ type Snapshot struct {
 	OpenPRs      []OpenPR      `json:"open_prs"`
 	History          []HistoryItem  `json:"history"`
 	Logs             []string       `json:"logs"`
-	TodayUsage       TokenUsage     `json:"today_usage"`
-	TotalUsage       TokenUsage     `json:"total_usage"`
-	PendingDecisions []DecisionItem `json:"pending_decisions"`
+	TodayUsage        TokenUsage         `json:"today_usage"`
+	TotalUsage        TokenUsage         `json:"total_usage"`
+	PendingDecisions  []DecisionItem     `json:"pending_decisions"`
+	ResolvedDecisions []ResolvedDecision `json:"resolved_decisions"`
 }
 
 type reviewJob struct {
@@ -647,6 +663,80 @@ func (b *Bot) addDecision(repo string, pr GHPR, reason, question, contextBody st
 	b.mu.Unlock()
 	b.log(fmt.Sprintf("🙋 已生成待拍板卡片：%s#%d（%s）", short, pr.Number, reason))
 	notifyMac("🙋 需要你拍板", fmt.Sprintf("%s#%d (%s)", short, pr.Number, sha8), item.Question, "Ping")
+}
+
+func (b *Bot) recordResolvedDecision(dec *DecisionItem, action, replyText, resultNote string) {
+	if dec == nil {
+		return
+	}
+	b.mu.Lock()
+	res := ResolvedDecision{
+		ID:         dec.ID,
+		ResolvedAt: nowISO(),
+		Repo:       dec.Repo,
+		ShortRepo:  dec.ShortRepo,
+		Number:     dec.Number,
+		Title:      dec.Title,
+		URL:        dec.URL,
+		Question:   dec.Question,
+		ReplyText:  strings.TrimSpace(replyText),
+		Action:     action,
+		ResultNote: resultNote,
+	}
+	b.state.ResolvedDecisions = append([]ResolvedDecision{res}, b.state.ResolvedDecisions...)
+	if len(b.state.ResolvedDecisions) > 30 {
+		b.state.ResolvedDecisions = b.state.ResolvedDecisions[:30]
+	}
+	writeJSONAtomic(b.statePath, b.state)
+	b.mu.Unlock()
+}
+
+func (b *Bot) syncStuckToDecisions() int {
+	b.mu.Lock()
+	openMap := make(map[string]OpenPR)
+	for _, p := range b.openPRs {
+		openMap[p.ID] = p
+	}
+	existing := make(map[string]bool)
+	for _, d := range b.state.PendingDecisions {
+		existing[fmt.Sprintf("%s#%d", d.Repo, d.Number)] = true
+	}
+	histCopy := append([]HistoryItem(nil), b.history...)
+	b.mu.Unlock()
+
+	seenPR := make(map[string]bool)
+	added := 0
+	for _, h := range histCopy {
+		key := fmt.Sprintf("%s#%d", h.Repo, h.Number)
+		if seenPR[key] || existing[key] {
+			continue
+		}
+		seenPR[key] = true
+		p, isOpen := openMap[key]
+		if !isOpen || h.Merged {
+			continue
+		}
+		if (h.Verdict == "CHANGES_REQUESTED" || h.Verdict == "NEEDS_DECISION") && !h.FixDispatched {
+			reason := "needs_decision"
+			q := h.Summary
+			if h.FixNote != "" {
+				q = h.FixNote + "\n" + h.Summary
+				if strings.Contains(h.FixNote, "上限") {
+					reason = "max_rounds"
+				} else if strings.Contains(h.FixNote, "无法") || strings.Contains(h.FixNote, "未绑定") {
+					reason = "session_unresumable"
+				}
+			}
+			b.addDecision(h.Repo, GHPR{
+				Number:     p.Number,
+				Title:      p.Title,
+				URL:        p.URL,
+				HeadRefOid: p.Sha8,
+			}, reason, q, h.Body, p.AgentSession)
+			added++
+		}
+	}
+	return added
 }
 
 func (b *Bot) removeDecision(id string) *DecisionItem {
@@ -1879,24 +1969,27 @@ func (b *Bot) snapshot() Snapshot {
 
 	decs := make([]DecisionItem, len(b.state.PendingDecisions))
 	copy(decs, b.state.PendingDecisions)
+	resDecs := make([]ResolvedDecision, len(b.state.ResolvedDecisions))
+	copy(resDecs, b.state.ResolvedDecisions)
 	today := time.Now().Format("2006-01-02")
 	return Snapshot{
-		Status:           status,
-		Paused:           b.paused,
-		Concurrency:      intDefault(b.cfg.Concurrency, 3),
-		AutoMerge:        boolDefault(b.cfg.AutoMerge, true),
-		AutoFix:          boolDefault(b.cfg.AutoFix, true),
-		LastScanAt:       b.lastScanAt,
-		NextScanIn:       nextIn,
-		Repos:            repos,
-		ActiveTasks:      actives,
-		PendingQueue:     pending,
-		OpenPRs:          openPRs,
-		History:          histCopy,
-		Logs:             logs,
-		TodayUsage:       b.state.DailyUsage[today],
-		TotalUsage:       b.state.TotalUsage,
-		PendingDecisions: decs,
+		Status:            status,
+		Paused:            b.paused,
+		Concurrency:       intDefault(b.cfg.Concurrency, 3),
+		AutoMerge:         boolDefault(b.cfg.AutoMerge, true),
+		AutoFix:           boolDefault(b.cfg.AutoFix, true),
+		LastScanAt:        b.lastScanAt,
+		NextScanIn:        nextIn,
+		Repos:             repos,
+		ActiveTasks:       actives,
+		PendingQueue:      pending,
+		OpenPRs:           openPRs,
+		History:           histCopy,
+		Logs:              logs,
+		TodayUsage:        b.state.DailyUsage[today],
+		TotalUsage:        b.state.TotalUsage,
+		PendingDecisions:  decs,
+		ResolvedDecisions: resDecs,
 	}
 }
 
@@ -2077,8 +2170,14 @@ func main() {
 			return
 		}
 		if req.Action == "dismiss" {
+			bot.recordResolvedDecision(dec, "dismiss", req.ReplyText, "已忽略")
 			bot.log(fmt.Sprintf("已忽略待拍板卡片：%s#%d", dec.ShortRepo, dec.Number))
 			writeJSON(w, 200, map[string]any{"ok": true, "message": "已忽略"})
+			return
+		}
+		if req.Action == "merge" {
+			bot.recordResolvedDecision(dec, "merge", req.ReplyText, "用户拍板直接合并")
+			writeJSON(w, 200, map[string]any{"ok": true, "message": "已记录合并决策"})
 			return
 		}
 		// authorize_fix: resume/dispatch agent with user's explicit authorization
@@ -2091,22 +2190,31 @@ func main() {
 				sid = parts[1]
 			}
 		}
-		note := "【用户已明确授权/拍板】" + strings.TrimSpace(req.ReplyText)
-		if strings.TrimSpace(req.ReplyText) == "" {
-			note = "【用户已授权按上述审查建议继续修复并推送】"
+		replyDisp := strings.TrimSpace(req.ReplyText)
+		if replyDisp == "" {
+			replyDisp = "授权按审查建议继续修复并推送"
 		}
-		// Reset fix_rounds for this PR so the re-review can continue cleanly
+		note := "【用户已明确授权/拍板】" + replyDisp
 		bot.mu.Lock()
 		bot.state.FixRounds[fmt.Sprintf("%s#%d", dec.Repo, dec.Number)] = 0
 		writeJSONAtomic(bot.statePath, bot.state)
 		bot.mu.Unlock()
 
 		ok, msg := bot.triggerManualFix(dec.Repo, dec.Number, dec.Context, ag, sid, note)
+		bot.recordResolvedDecision(dec, "authorize_fix", replyDisp, msg)
 		code := 200
 		if !ok {
 			code = 500
 		}
 		writeJSON(w, code, map[string]any{"ok": ok, "message": msg})
+	})
+	mux.HandleFunc("/api/decision/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"ok": false})
+			return
+		}
+		n := bot.syncStuckToDecisions()
+		writeJSON(w, 200, map[string]any{"ok": true, "added": n, "message": fmt.Sprintf("已同步 %d 条待拍板 PR", n)})
 	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

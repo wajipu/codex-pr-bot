@@ -66,6 +66,25 @@ struct DecisionItem: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+struct ResolvedDecision: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let resolved_at: String
+    let repo: String
+    let short_repo: String?
+    let number: Int
+    let title: String
+    let url: String
+    let question: String
+    let reply_text: String
+    let action: String
+    let result_note: String
+
+    var displayRepo: String {
+        if let s = short_repo, !s.isEmpty { return s }
+        return String(repo.split(separator: "/").last ?? Substring(repo))
+    }
+}
+
 struct BotSnapshot: Codable, Equatable, Sendable {
     let status: String
     let paused: Bool
@@ -81,6 +100,7 @@ struct BotSnapshot: Codable, Equatable, Sendable {
     let today_usage: TokenUsage?
     let total_usage: TokenUsage?
     let pending_decisions: [DecisionItem]?
+    let resolved_decisions: [ResolvedDecision]?
 }
 
 struct PipelineStep: Codable, Equatable, Sendable {
@@ -207,6 +227,7 @@ struct BotConfigPayload: Codable, Equatable, Sendable {
 
 enum PopoverTab: String, CaseIterable, Identifiable {
     case prs = "Open PR"
+    case decisions = "待拍板"
     case running = "链路"
     case history = "历史"
     case logs = "日志"
@@ -235,6 +256,7 @@ final class BotStore: ObservableObject {
     @Published var todayUsage: TokenUsage?
     @Published var totalUsage: TokenUsage?
     @Published var pendingDecisions: [DecisionItem] = []
+    @Published var resolvedDecisions: [ResolvedDecision] = []
     @Published var toastMessage: String?
     @Published var lastError: String?
 
@@ -343,6 +365,8 @@ final class BotStore: ObservableObject {
             }
             pendingDecisions = decs
         }
+        let resDecs = d.resolved_decisions ?? []
+        if resolvedDecisions != resDecs { resolvedDecisions = resDecs }
     }
 
     private func notifyForHistory(_ item: HistoryItem) {
@@ -476,6 +500,14 @@ final class BotStore: ObservableObject {
                 "number": number
             ])
             showToast(ok ? "🎉 已合并 \(repo.split(separator: "/").last ?? "")#\(number)" : "合并失败，请检查日志/冲突")
+            refreshNow()
+        }
+    }
+
+    func syncStuckDecisions() {
+        Task {
+            let ok = await post(path: "api/decision/sync", body: [:])
+            showToast(ok ? "已同步卡住的待拍板 PR" : "同步失败")
             refreshNow()
         }
     }
@@ -846,6 +878,7 @@ struct PopoverView: View {
         guard store.connected else { return nil }
         switch t {
         case .prs: return store.openPRs.count
+        case .decisions: return store.pendingDecisions.count
         case .running: return store.activeTasks.count + store.pendingQueue.count
         case .history: return store.history.count
         case .logs: return nil
@@ -857,6 +890,7 @@ struct PopoverView: View {
         if store.connected {
             switch tab {
             case .prs: prsListView
+            case .decisions: decisionsTabView
             case .running: runningListView
             case .history: historyListView
             case .logs: logsListView
@@ -967,6 +1001,91 @@ struct PopoverView: View {
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
                         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    private var decisionsTabView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("待拍板 \(store.pendingDecisions.count) · 已处理 \(store.resolvedDecisions.count)")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("拉取卡住 PR") {
+                        store.syncStuckDecisions()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+
+                if store.pendingDecisions.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal")
+                            .font(.system(size: 26))
+                            .foregroundStyle(.green.opacity(0.85))
+                        Text("当前没有待你拍板的 PR 提问")
+                            .font(.system(size: 12.5, weight: .medium))
+                        Text("当 PR 涉及跨范围/接口授权、达到修复上限或原会话不可恢复时，会自动在这里发起提问；你也可以点右上角「拉取卡住 PR」。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+                    .padding(.horizontal, 12)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+                } else {
+                    decisionsBannerSection
+                }
+
+                if !store.resolvedDecisions.isEmpty {
+                    Text("已处理决策记录")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+
+                    ForEach(store.resolvedDecisions) { r in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "bubble.left.and.bubble.right.fill")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                                if let u = URL(string: r.url) {
+                                    Link("\(r.displayRepo)#\(r.number)", destination: u)
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                }
+                                Spacer()
+                                Text(String(r.resolved_at.suffix(8)))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(r.question)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+
+                            if !r.reply_text.isEmpty {
+                                HStack {
+                                    Spacer()
+                                    Text(r.reply_text)
+                                        .font(.system(size: 11.5, weight: .medium))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color.accentColor.opacity(0.22), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                                }
+                            }
+
+                            Text("⚡ \(r.result_note)")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(r.action == "merge" ? .purple : .cyan)
+                        }
+                        .padding(10)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
                     }
                 }
             }
