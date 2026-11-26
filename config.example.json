@@ -17,6 +17,9 @@
     "dependabot/",
     "renovate/"
   ],
+  "allowed_commenters": [
+    "your-github-username"
+  ],
   "reasoning_effort": "high",
   "timeout_seconds": 900,
   "fix_timeout_seconds": 900,

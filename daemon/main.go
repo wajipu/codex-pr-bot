@@ -54,6 +54,7 @@ type Config struct {
 	FallbackFixer        string                     `json:"fallback_fixer"`
 	MaxFixRounds         int                        `json:"max_fix_rounds"`
 	IgnoreBranchPrefixes []string                   `json:"ignore_branch_prefixes"`
+	AllowedCommenters    []string                   `json:"allowed_commenters"`
 	ReasoningEffort      string                     `json:"reasoning_effort"`
 	TimeoutSeconds       int                        `json:"timeout_seconds"`
 	FixTimeoutSeconds    int                        `json:"fix_timeout_seconds"`
@@ -109,13 +110,29 @@ func (u *TokenUsage) add(other TokenUsage) {
 	u.GrossTokens = u.InputTokens + u.OutputTokens
 }
 
+type DecisionItem struct {
+	ID           string  `json:"id"`
+	CreatedAt    string  `json:"created_at"`
+	Repo         string  `json:"repo"`
+	ShortRepo    string  `json:"short_repo"`
+	Number       int     `json:"number"`
+	Title        string  `json:"title"`
+	URL          string  `json:"url"`
+	Sha8         string  `json:"sha8"`
+	Reason       string  `json:"reason"` // needs_decision | max_rounds | session_unresumable
+	Question     string  `json:"question"`
+	Context      string  `json:"context"`
+	AgentSession *string `json:"agent_session,omitempty"`
+}
+
 type State struct {
-	SeenAuto        map[string]string         `json:"seen_auto"`
-	SeenCmd         map[string]string         `json:"seen_cmd"`
-	FixRounds       map[string]int            `json:"fix_rounds"`
-	SessionBindings map[string]SessionBinding `json:"session_bindings"`
-	TotalUsage      TokenUsage                `json:"total_usage"`
-	DailyUsage      map[string]TokenUsage     `json:"daily_usage"`
+	SeenAuto         map[string]string         `json:"seen_auto"`
+	SeenCmd          map[string]string         `json:"seen_cmd"`
+	FixRounds        map[string]int            `json:"fix_rounds"`
+	SessionBindings  map[string]SessionBinding `json:"session_bindings"`
+	TotalUsage       TokenUsage                `json:"total_usage"`
+	DailyUsage       map[string]TokenUsage     `json:"daily_usage"`
+	PendingDecisions []DecisionItem            `json:"pending_decisions"`
 }
 
 // MARK: - GitHub PR JSON
@@ -241,10 +258,11 @@ type Snapshot struct {
 	ActiveTasks  []ActiveTask  `json:"active_tasks"`
 	PendingQueue []QueuedTask  `json:"pending_queue"`
 	OpenPRs      []OpenPR      `json:"open_prs"`
-	History      []HistoryItem `json:"history"`
-	Logs         []string      `json:"logs"`
-	TodayUsage   TokenUsage    `json:"today_usage"`
-	TotalUsage   TokenUsage    `json:"total_usage"`
+	History          []HistoryItem  `json:"history"`
+	Logs             []string       `json:"logs"`
+	TodayUsage       TokenUsage     `json:"today_usage"`
+	TotalUsage       TokenUsage     `json:"total_usage"`
+	PendingDecisions []DecisionItem `json:"pending_decisions"`
 }
 
 type reviewJob struct {
@@ -494,6 +512,9 @@ func classifyVerdict(body string) string {
 	} else {
 		first = strings.TrimSpace(body)
 	}
+	if strings.Contains(first, "🤔") || strings.Contains(first, "需人工拍板") || strings.Contains(first, "需要授权") {
+		return "NEEDS_DECISION"
+	}
 	if strings.Contains(first, "❌") || strings.Contains(first, "高风险") || strings.Contains(first, "⚠️") || strings.Contains(first, "建议修改") {
 		return "CHANGES_REQUESTED"
 	}
@@ -579,16 +600,71 @@ func (b *Bot) buildReviewPrompt(repo string, pr GHPR, diffText, triggerInfo, age
 	sb.WriteString("3. **安全红线**：密钥/Token/内网地址/运行时产物误入库。\n")
 	sb.WriteString("4. **规范与附加指令**：若违反仓库 AGENTS.md，或触发评论带了额外重点要求，请明确指出。\n\n")
 	sb.WriteString("## 输出格式（严格遵守）\n")
-	sb.WriteString("第一行必须以以下三者之一开头，并附 1 句话总结：\n")
+	sb.WriteString("第一行必须以以下四者之一开头，并附 1 句话总结：\n")
 	sb.WriteString("- `✅ 未发现明显阻断问题`（可合并）\n")
-	sb.WriteString("- `⚠️ 建议修改后再合并`（存在需修复的问题）\n")
-	sb.WriteString("- `❌ 存在高风险问题`（严重阻断）\n\n")
+	sb.WriteString("- `⚠️ 建议修改后再合并`（存在明确的局部缺陷，可直接修复）\n")
+	sb.WriteString("- `❌ 存在高风险问题`（严重阻断）\n")
+	sb.WriteString("- `🤔 需人工拍板`（涉及跨范围接口契约变更、产品意图不明、删功能或需用户授权的决策，请说明选项请用户拍板）\n\n")
 	sb.WriteString("然后必须包含以下两个标题：\n### 问题清单\n按 P0 / P1 / P2 分级，每条包含 `文件:行号`、原因与影响、修复建议；无问题写「无」。\n\n")
 	sb.WriteString("## 待测试功能清单\n列出合并后需要人工或真机重点测试的 2～5 个具体功能场景（每条以 `- [ ] ` 开头，说人话，方便直接照单验收）。\n\n")
 	sb.WriteString("## PR Diff\n```diff\n")
 	sb.WriteString(diffText)
 	sb.WriteString("\n```\n")
 	return sb.String()
+}
+
+func (b *Bot) addDecision(repo string, pr GHPR, reason, question, contextBody string, sessPtr *string) {
+	short := shortRepoName(repo)
+	sha8 := shaPrefix(pr.HeadRefOid)
+	item := DecisionItem{
+		ID:           fmt.Sprintf("dec-%s-%d-%d", short, pr.Number, time.Now().UnixMilli()),
+		CreatedAt:    nowISO(),
+		Repo:         repo,
+		ShortRepo:    short,
+		Number:       pr.Number,
+		Title:        pr.Title,
+		URL:          pr.URL,
+		Sha8:         sha8,
+		Reason:       reason,
+		Question:     truncate(strings.TrimSpace(question), 240),
+		Context:      truncate(strings.TrimSpace(contextBody), 4000),
+		AgentSession: sessPtr,
+	}
+	b.mu.Lock()
+	// Replace any older pending decision for the same PR
+	kept := make([]DecisionItem, 0, len(b.state.PendingDecisions)+1)
+	kept = append(kept, item)
+	for _, old := range b.state.PendingDecisions {
+		if !(old.Repo == repo && old.Number == pr.Number) {
+			kept = append(kept, old)
+		}
+	}
+	if len(kept) > 20 {
+		kept = kept[:20]
+	}
+	b.state.PendingDecisions = kept
+	writeJSONAtomic(b.statePath, b.state)
+	b.mu.Unlock()
+	b.log(fmt.Sprintf("🙋 已生成待拍板卡片：%s#%d（%s）", short, pr.Number, reason))
+	notifyMac("🙋 需要你拍板", fmt.Sprintf("%s#%d (%s)", short, pr.Number, sha8), item.Question, "Ping")
+}
+
+func (b *Bot) removeDecision(id string) *DecisionItem {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var found *DecisionItem
+	kept := make([]DecisionItem, 0, len(b.state.PendingDecisions))
+	for _, d := range b.state.PendingDecisions {
+		if d.ID == id {
+			cp := d
+			found = &cp
+			continue
+		}
+		kept = append(kept, d)
+	}
+	b.state.PendingDecisions = kept
+	writeJSONAtomic(b.statePath, b.state)
+	return found
 }
 
 func (b *Bot) bindSession(repo string, number int, agent, sessionID string) {
@@ -752,6 +828,23 @@ func (b *Bot) scanOnce() int {
 						author := latestCmd.Author.Login
 						if author == "" {
 							author = "unknown"
+						}
+						if len(cfg.AllowedCommenters) > 0 {
+							allowed := false
+							for _, u := range cfg.AllowedCommenters {
+								if strings.EqualFold(strings.TrimSpace(u), author) {
+									allowed = true
+									break
+								}
+							}
+							if !allowed {
+								b.mu.Lock()
+								b.state.SeenCmd[cmdKey] = "ignored:" + nowISO()
+								writeJSONAtomic(b.statePath, b.state)
+								b.mu.Unlock()
+								b.log(fmt.Sprintf("已忽略非白名单用户 @%s 在 %s#%d 的触发指令", author, shortRepoName(repo), pr.Number))
+								continue
+							}
 						}
 						cmdText := truncate(strings.ReplaceAll(strings.TrimSpace(latestCmd.Body), "\n", " "), 240)
 						if b.enqueueJob(reviewJob{
@@ -1501,9 +1594,17 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 				finishStep("failed", mergeNote)
 				b.log(fmt.Sprintf("[Worker #%d] ⚠️ %s#%d %s", workerID, short, pr.Number, mergeNote))
 			}
+		} else if verdict == "NEEDS_DECISION" {
+			firstQ := reviewBody
+			if idx := strings.IndexByte(firstQ, '\n'); idx >= 0 {
+				firstQ = firstQ[:idx]
+			}
+			b.addDecision(repo, pr, "needs_decision", firstQ, reviewBody, sessPtr)
+			fixNote = "需人工拍板：已生成待确认卡片"
 		} else if verdict == "CHANGES_REQUESTED" && boolDefault(cfg.AutoFix, true) {
 			if sid == "" && !boolDefault(cfg.FallbackNewSession, false) {
-				fixNote = "未绑定可恢复的 CLI 会话（已按配置不新开会话，可点「复制修复指令」自行粘贴修复）"
+				fixNote = "未绑定可恢复的 CLI 会话（已按配置不新开会话，请拍板或复制修复指令）"
+				b.addDecision(repo, pr, "session_unresumable", fixNote, reviewBody, sessPtr)
 				b.log(fmt.Sprintf("[Worker #%d] ⏸ %s#%d %s", workerID, short, pr.Number, fixNote))
 			} else {
 				maxRounds := intDefault(cfg.MaxFixRounds, 2)
@@ -1537,10 +1638,12 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 						}
 					} else {
 						finishStep("failed", fNote)
+						b.addDecision(repo, pr, "session_unresumable", fNote, reviewBody, sessPtr)
 						b.log(fmt.Sprintf("[Worker #%d] ❌ %s", workerID, fNote))
 					}
 				} else {
-					fixNote = fmt.Sprintf("已达自动修复上限（%d 轮），请人工介入", maxRounds)
+					fixNote = fmt.Sprintf("已达自动修复上限（%d 轮），请人工拍板继续修还是直接合并", maxRounds)
+					b.addDecision(repo, pr, "max_rounds", fixNote, reviewBody, sessPtr)
 					b.log(fmt.Sprintf("[Worker #%d] ⏹ %s#%d %s", workerID, short, pr.Number, fixNote))
 				}
 			}
@@ -1774,23 +1877,26 @@ func (b *Bot) snapshot() Snapshot {
 	logs := make([]string, len(b.logs))
 	copy(logs, b.logs)
 
+	decs := make([]DecisionItem, len(b.state.PendingDecisions))
+	copy(decs, b.state.PendingDecisions)
 	today := time.Now().Format("2006-01-02")
 	return Snapshot{
-		Status:       status,
-		Paused:       b.paused,
-		Concurrency:  intDefault(b.cfg.Concurrency, 3),
-		AutoMerge:    boolDefault(b.cfg.AutoMerge, true),
-		AutoFix:      boolDefault(b.cfg.AutoFix, true),
-		LastScanAt:   b.lastScanAt,
-		NextScanIn:   nextIn,
-		Repos:        repos,
-		ActiveTasks:  actives,
-		PendingQueue: pending,
-		OpenPRs:      openPRs,
-		History:      histCopy,
-		Logs:         logs,
-		TodayUsage:   b.state.DailyUsage[today],
-		TotalUsage:   b.state.TotalUsage,
+		Status:           status,
+		Paused:           b.paused,
+		Concurrency:      intDefault(b.cfg.Concurrency, 3),
+		AutoMerge:        boolDefault(b.cfg.AutoMerge, true),
+		AutoFix:          boolDefault(b.cfg.AutoFix, true),
+		LastScanAt:       b.lastScanAt,
+		NextScanIn:       nextIn,
+		Repos:            repos,
+		ActiveTasks:      actives,
+		PendingQueue:     pending,
+		OpenPRs:          openPRs,
+		History:          histCopy,
+		Logs:             logs,
+		TodayUsage:       b.state.DailyUsage[today],
+		TotalUsage:       b.state.TotalUsage,
+		PendingDecisions: decs,
 	}
 }
 
@@ -1952,13 +2058,68 @@ func main() {
 		bot.log(fmt.Sprintf("🎉 手动合并成功 %s#%d（%s）", shortRepoName(repo), req.Number, label))
 		writeJSON(w, 200, map[string]any{"ok": true, "message": fmt.Sprintf("已合并 %s#%d（%s）", shortRepoName(repo), req.Number, label)})
 	})
+	mux.HandleFunc("/api/decision/reply", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"ok": false})
+			return
+		}
+		var req struct {
+			ID        string `json:"id"`
+			Action    string `json:"action"` // authorize_fix | dismiss
+			ReplyText string `json:"reply_text"`
+			Agent     string `json:"agent"`
+			SessionID string `json:"session_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		dec := bot.removeDecision(strings.TrimSpace(req.ID))
+		if dec == nil {
+			writeJSON(w, 404, map[string]any{"ok": false, "message": "未找到该待拍板卡片"})
+			return
+		}
+		if req.Action == "dismiss" {
+			bot.log(fmt.Sprintf("已忽略待拍板卡片：%s#%d", dec.ShortRepo, dec.Number))
+			writeJSON(w, 200, map[string]any{"ok": true, "message": "已忽略"})
+			return
+		}
+		// authorize_fix: resume/dispatch agent with user's explicit authorization
+		ag := strings.TrimSpace(req.Agent)
+		sid := strings.TrimSpace(req.SessionID)
+		if ag == "" && dec.AgentSession != nil && strings.Contains(*dec.AgentSession, ":") {
+			parts := strings.SplitN(*dec.AgentSession, ":", 2)
+			ag = parts[0]
+			if sid == "" {
+				sid = parts[1]
+			}
+		}
+		note := "【用户已明确授权/拍板】" + strings.TrimSpace(req.ReplyText)
+		if strings.TrimSpace(req.ReplyText) == "" {
+			note = "【用户已授权按上述审查建议继续修复并推送】"
+		}
+		// Reset fix_rounds for this PR so the re-review can continue cleanly
+		bot.mu.Lock()
+		bot.state.FixRounds[fmt.Sprintf("%s#%d", dec.Repo, dec.Number)] = 0
+		writeJSONAtomic(bot.statePath, bot.state)
+		bot.mu.Unlock()
+
+		ok, msg := bot.triggerManualFix(dec.Repo, dec.Number, dec.Context, ag, sid, note)
+		code := 200
+		if !ok {
+			code = 500
+		}
+		writeJSON(w, code, map[string]any{"ok": ok, "message": msg})
+	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			cfg := bot.reloadConfig()
+			allow := cfg.AllowedCommenters
+			if allow == nil {
+				allow = []string{}
+			}
 			writeJSON(w, 200, map[string]any{
 				"repos":                 cfg.Repos,
 				"local_repo_map":        cfg.LocalRepoMap,
+				"allowed_commenters":    allow,
 				"auto_review":           boolDefault(cfg.AutoReview, true),
 				"comment_trigger":       boolDefault(cfg.CommentTrigger, true),
 				"auto_fix":              boolDefault(cfg.AutoFix, true),
@@ -1976,6 +2137,7 @@ func main() {
 			var patch struct {
 				Repos               *[]string          `json:"repos"`
 				LocalRepoMap        *map[string]string `json:"local_repo_map"`
+				AllowedCommenters   *[]string          `json:"allowed_commenters"`
 				AutoReview          *bool              `json:"auto_review"`
 				CommentTrigger      *bool              `json:"comment_trigger"`
 				AutoFix             *bool              `json:"auto_fix"`
@@ -1998,6 +2160,9 @@ func main() {
 			}
 			if patch.LocalRepoMap != nil {
 				cfg.LocalRepoMap = *patch.LocalRepoMap
+			}
+			if patch.AllowedCommenters != nil {
+				cfg.AllowedCommenters = *patch.AllowedCommenters
 			}
 			if patch.AutoReview != nil {
 				cfg.AutoReview = patch.AutoReview

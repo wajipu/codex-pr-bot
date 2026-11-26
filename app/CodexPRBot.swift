@@ -46,6 +46,26 @@ struct TokenUsage: Codable, Equatable, Sendable {
     }
 }
 
+struct DecisionItem: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let created_at: String
+    let repo: String
+    let short_repo: String?
+    let number: Int
+    let title: String
+    let url: String
+    let sha8: String
+    let reason: String
+    let question: String
+    let context: String
+    let agent_session: String?
+
+    var displayRepo: String {
+        if let s = short_repo, !s.isEmpty { return s }
+        return String(repo.split(separator: "/").last ?? Substring(repo))
+    }
+}
+
 struct BotSnapshot: Codable, Equatable, Sendable {
     let status: String
     let paused: Bool
@@ -60,6 +80,7 @@ struct BotSnapshot: Codable, Equatable, Sendable {
     let logs: [String]
     let today_usage: TokenUsage?
     let total_usage: TokenUsage?
+    let pending_decisions: [DecisionItem]?
 }
 
 struct PipelineStep: Codable, Equatable, Sendable {
@@ -169,6 +190,7 @@ struct GitHubRelease: Codable, Sendable {
 struct BotConfigPayload: Codable, Equatable, Sendable {
     var repos: [String]
     var local_repo_map: [String: String]?
+    var allowed_commenters: [String]?
     var auto_review: Bool
     var comment_trigger: Bool
     var auto_fix: Bool
@@ -212,6 +234,7 @@ final class BotStore: ObservableObject {
     @Published var logs: [String] = []
     @Published var todayUsage: TokenUsage?
     @Published var totalUsage: TokenUsage?
+    @Published var pendingDecisions: [DecisionItem] = []
     @Published var toastMessage: String?
     @Published var lastError: String?
 
@@ -309,6 +332,17 @@ final class BotStore: ObservableObject {
         if logs != d.logs { logs = d.logs }
         if todayUsage != d.today_usage { todayUsage = d.today_usage }
         if totalUsage != d.total_usage { totalUsage = d.total_usage }
+        let decs = d.pending_decisions ?? []
+        if pendingDecisions != decs {
+            if initializedHistory, let first = decs.first, !pendingDecisions.contains(where: { $0.id == first.id }) {
+                NotificationDelegate.shared.send(
+                    title: "🙋 需要你拍板 · \(first.displayRepo)#\(first.number)",
+                    subtitle: first.title,
+                    body: first.question
+                )
+            }
+            pendingDecisions = decs
+        }
     }
 
     private func notifyForHistory(_ item: HistoryItem) {
@@ -446,6 +480,22 @@ final class BotStore: ObservableObject {
         }
     }
 
+    func replyDecision(id: String, action: String, replyText: String = "") {
+        Task {
+            let ok = await post(path: "api/decision/reply", body: [
+                "id": id,
+                "action": action,
+                "reply_text": replyText
+            ])
+            if action == "dismiss" {
+                showToast(ok ? "已忽略该拍板项" : "操作失败")
+            } else {
+                showToast(ok ? "已授权并续接 Agent 执行" : "派发失败，请检查日志")
+            }
+            refreshNow()
+        }
+    }
+
     func fetchConfig() async -> BotConfigPayload? {
         let session = self.localSession
         let url = self.baseURL.appendingPathComponent("api/config")
@@ -500,12 +550,15 @@ final class BotStore: ObservableObject {
     }
 
     var menuBarText: String {
-        guard connected, !activeTasks.isEmpty else { return "" }
-        return "\(activeTasks.count)/\(concurrency)"
+        guard connected else { return "" }
+        if !pendingDecisions.isEmpty { return "待批 \(pendingDecisions.count)" }
+        if !activeTasks.isEmpty { return "\(activeTasks.count)/\(concurrency)" }
+        return ""
     }
 
     var menuBarSymbol: String {
         guard connected else { return "exclamationmark.triangle" }
+        if !pendingDecisions.isEmpty { return "questionmark.bubble.fill" }
         if !activeTasks.isEmpty { return "bolt.circle.fill" }
         if paused { return "pause.circle" }
         return "checkmark.bubble.fill"
@@ -529,6 +582,7 @@ struct PopoverView: View {
     @State private var fixNote = ""
     @State private var showClosedHistory = false
     @State private var showSettings = false
+    @State private var decisionReplies: [String: String] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -833,6 +887,9 @@ struct PopoverView: View {
     private var prsListView: some View {
         ScrollView {
             LazyVStack(spacing: 6) {
+                if !store.pendingDecisions.isEmpty {
+                    decisionsBannerSection
+                }
                 if !store.activeTasks.isEmpty {
                     Button { tab = .running } label: {
                         HStack(spacing: 8) {
@@ -915,6 +972,87 @@ struct PopoverView: View {
             }
             .padding(12)
         }
+    }
+
+    private var decisionsBannerSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.raised.fill")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.yellow)
+                Text("需要你拍板授权 (\(store.pendingDecisions.count))")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.yellow)
+                Spacer()
+            }
+
+            ForEach(store.pendingDecisions) { dec in
+                let replyBinding = Binding<String>(
+                    get: { decisionReplies[dec.id] ?? "" },
+                    set: { decisionReplies[dec.id] = $0 }
+                )
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 6) {
+                        if let u = URL(string: dec.url) {
+                            Link("\(dec.displayRepo)#\(dec.number)", destination: u)
+                                .font(.system(size: 12.5, weight: .bold, design: .monospaced))
+                        }
+                        if let sess = dec.agent_session {
+                            Text(sess.split(separator: ":").first.map(String.init) ?? "agent")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.cyan.opacity(0.18), in: Capsule())
+                                .foregroundStyle(.cyan)
+                        }
+                        Spacer()
+                        Text(String(dec.created_at.suffix(8)))
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(dec.question)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.primary)
+                        .lineLimit(3)
+
+                    TextField("输入授权/修改决定（如：授权增加内部选店回执）", text: replyBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11.5))
+
+                    HStack(spacing: 6) {
+                        Button("授权并续接修复") {
+                            let txt = decisionReplies[dec.id] ?? ""
+                            store.replyDecision(id: dec.id, action: "authorize_fix", replyText: txt)
+                            decisionReplies.removeValue(forKey: dec.id)
+                            tab = .running
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+
+                        Button("直接合并") {
+                            store.mergePR(repo: dec.repo, number: dec.number)
+                            store.replyDecision(id: dec.id, action: "dismiss")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+
+                        Spacer()
+
+                        Button("忽略") {
+                            store.replyDecision(id: dec.id, action: "dismiss")
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(Color.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.yellow.opacity(0.4), lineWidth: 0.9))
+            }
+        }
+        .padding(.bottom, 6)
     }
 
     private var runningListView: some View {
@@ -1537,6 +1675,7 @@ struct SettingsSheetView: View {
     @State private var cfg: BotConfigPayload?
     @State private var newRepo = ""
     @State private var newRepoPath = ""
+    @State private var allowText = ""
     @State private var saving = false
 
     private let efforts = ["low", "medium", "high", "max"]
@@ -1642,6 +1781,15 @@ struct SettingsSheetView: View {
                                 Stepper("\(c.concurrency.wrappedValue) 个", value: c.concurrency, in: 1...5)
                                     .font(.system(size: 12, design: .monospaced))
                             }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("评论触发白名单（GitHub 用户名，逗号分隔，留空不限）")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                TextField("例如：wajipu", text: $allowText)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11.5, design: .monospaced))
+                            }
                         }
 
                         Divider().opacity(0.25)
@@ -1712,7 +1860,12 @@ struct SettingsSheetView: View {
                 Spacer()
                 Button("取消", action: onClose)
                 Button(saving ? "保存中..." : "保存设置") {
-                    guard let current = cfg else { return }
+                    guard var current = cfg else { return }
+                    let parsed = allowText
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    current.allowed_commenters = parsed
                     saving = true
                     Task {
                         _ = await store.saveConfig(current)
@@ -1729,7 +1882,9 @@ struct SettingsSheetView: View {
         }
         .frame(width: 400, height: 520)
         .task {
-            cfg = await store.fetchConfig()
+            let loaded = await store.fetchConfig()
+            cfg = loaded
+            allowText = (loaded?.allowed_commenters ?? []).joined(separator: ", ")
         }
     }
 }
