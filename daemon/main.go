@@ -2693,6 +2693,39 @@ func main() {
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "message": "已触发立即扫描"})
 	})
+	mux.HandleFunc("/api/pos-build", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]any{"ok": false})
+			return
+		}
+		cfg := bot.reloadConfig()
+		gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, stderr, err := runCmd(ctx, "", "", gh, "workflow", "run", "release-android-pos.yml", "-R", "koklam-saas/kservice", "--ref", "develop", "-f", "force=true")
+		if err != nil {
+			msg := "触发收银机打包失败: " + truncate(strings.TrimSpace(stderr), 160)
+			bot.log("❌ " + msg)
+			writeJSON(w, 500, map[string]any{"ok": false, "message": msg})
+			return
+		}
+		actionsURL := "https://github.com/koklam-saas/kservice/actions/workflows/release-android-pos.yml"
+		bot.log("📦 已触发收银机 Android APK 打包（GitHub Actions）")
+		bot.appendEvent(TimelineEvent{
+			Kind:    "started",
+			Actor:   "收银机打包",
+			Pill:    "kservice Android APK",
+			Summary: "已触发 GitHub Actions 打包 Android POS APK（含内置 Edge）",
+			Detail:  "构建完成后将自动上传至 GitHub Releases：\nhttps://github.com/koklam-saas/kservice/releases\n\n实时构建日志：\n" + actionsURL,
+			Repo:    "koklam-saas/kservice",
+			URL:     actionsURL,
+		})
+		writeJSON(w, 200, map[string]any{
+			"ok":          true,
+			"message":     "已触发收银机 Android APK 打包（GitHub Actions）",
+			"actions_url": actionsURL,
+		})
+	})
 	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]any{"ok": false})
@@ -2714,6 +2747,25 @@ func main() {
 		prNum := 0
 		if len(numMatch) > 1 {
 			prNum, _ = strconv.Atoi(numMatch[1])
+		}
+
+		// 0. POS Android APK build trigger
+		if strings.Contains(lower, "打包收银机") || strings.Contains(lower, "收银机打包") || strings.Contains(lower, "pos 打包") || strings.Contains(lower, "打包 apk") {
+			cfg := bot.reloadConfig()
+			gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, stderr, err := runCmd(ctx, "", "", gh, "workflow", "run", "release-android-pos.yml", "-R", "koklam-saas/kservice", "--ref", "develop", "-f", "force=true")
+			cancel()
+			if err != nil {
+				msg := "触发收银机打包失败（请确认 PR #9 已合并到 develop）：" + truncate(strings.TrimSpace(stderr), 140)
+				bot.appendChat("assistant", msg, "收银机打包")
+				writeJSON(w, 200, map[string]any{"ok": false, "message": msg})
+				return
+			}
+			msg := "已触发 GitHub Actions 打包收银机 Android APK（含内置 Edge），打包完成后自动上传到 GitHub Releases。"
+			bot.appendChat("assistant", msg, "📦 收银机打包")
+			writeJSON(w, 200, map[string]any{"ok": true, "message": msg})
+			return
 		}
 
 		// 1. Targeted PR command (#N)

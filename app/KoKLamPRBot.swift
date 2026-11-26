@@ -524,6 +524,14 @@ final class BotStore: ObservableObject {
         }
     }
 
+    func triggerPOSBuild() {
+        Task {
+            let ok = await post(path: "api/pos-build", body: [:])
+            showToast(ok ? "📦 已触发收银机 Android APK 打包（GitHub Actions）" : "触发打包失败，请确认打包工作流已合入 develop")
+            refreshNow()
+        }
+    }
+
     private func notifyForHistory(_ item: HistoryItem) {
         let sub = "\(item.displayRepo)#\(item.number) (\(item.sha8)) · \(item.duration_sec)s"
         if !item.ok {
@@ -2530,6 +2538,17 @@ struct MainStreamWindowView: View {
             iconBtn("gearshape", help: "设置") { showSettings = true }
 
             Menu {
+                Button { store.triggerPOSBuild() } label: {
+                    Label("一键打包收银机 APK", systemImage: "shippingbox")
+                }
+                Button {
+                    if let u = URL(string: "https://github.com/koklam-saas/kservice/releases") {
+                        NSWorkspace.shared.open(u)
+                    }
+                } label: {
+                    Label("打开收银机 Releases", systemImage: "arrow.down.circle")
+                }
+                Divider()
                 Button { showLogsSheet = true } label: {
                     Label("查看运行日志", systemImage: "terminal")
                 }
@@ -3160,6 +3179,7 @@ struct MainStreamWindowView: View {
             // Quick prompt chips + today token usage
             HStack(spacing: 8) {
                 quickChip("open 都看下吧")
+                quickChip("📦 打包收银机")
                 quickChip("扫描新 PR")
                 if let firstDec = store.pendingDecisions.first {
                     quickChip("授权新开会话修复 #\(firstDec.number)")
