@@ -83,6 +83,7 @@ type Config struct {
 	MaxFixRounds         int                        `json:"max_fix_rounds"`
 	IgnoreBranchPrefixes []string                   `json:"ignore_branch_prefixes"`
 	AllowedCommenters    []string                   `json:"allowed_commenters"`
+	ReviewModel          string                     `json:"review_model"`
 	ReasoningEffort      string                     `json:"reasoning_effort"`
 	TimeoutSeconds       int                        `json:"timeout_seconds"`
 	FixTimeoutSeconds    int                        `json:"fix_timeout_seconds"`
@@ -1837,7 +1838,11 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		defer os.Remove(outPath)
 
 		effort := strings.TrimSpace(cfg.ReasoningEffort)
+		model := strings.TrimSpace(cfg.ReviewModel)
 		args := []string{"exec", "--json", "--ephemeral", "-s", "read-only", "-C", workDir, "--skip-git-repo-check"}
+		if model != "" {
+			args = append(args, "-m", model)
+		}
 		if effort != "" {
 			args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, effort))
 		}
@@ -2474,6 +2479,7 @@ func main() {
 				"github_app_private_key": cfg.GitHubAppPrivateKey,
 				"fallback_fixer":         cfg.FallbackFixer,
 				"max_fix_rounds":        intDefault(cfg.MaxFixRounds, 2),
+				"review_model":          cfg.ReviewModel,
 				"reasoning_effort":      cfg.ReasoningEffort,
 				"poll_interval_seconds": intDefault(cfg.PollIntervalSeconds, 120),
 				"concurrency":           intDefault(cfg.Concurrency, 3),
@@ -2495,6 +2501,7 @@ func main() {
 				GitHubAppPrivateKey *string            `json:"github_app_private_key"`
 				FallbackFixer       *string            `json:"fallback_fixer"`
 				MaxFixRounds        *int               `json:"max_fix_rounds"`
+				ReviewModel         *string            `json:"review_model"`
 				ReasoningEffort     *string            `json:"reasoning_effort"`
 				PollIntervalSeconds *int               `json:"poll_interval_seconds"`
 				Concurrency         *int               `json:"concurrency"`
@@ -2545,6 +2552,9 @@ func main() {
 			}
 			if patch.MaxFixRounds != nil && *patch.MaxFixRounds > 0 {
 				cfg.MaxFixRounds = *patch.MaxFixRounds
+			}
+			if patch.ReviewModel != nil {
+				cfg.ReviewModel = strings.TrimSpace(*patch.ReviewModel)
 			}
 			if patch.ReasoningEffort != nil {
 				cfg.ReasoningEffort = strings.TrimSpace(*patch.ReasoningEffort)

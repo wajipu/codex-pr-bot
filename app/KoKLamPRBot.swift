@@ -222,6 +222,7 @@ struct BotConfigPayload: Codable, Equatable, Sendable {
     var github_app_private_key: String?
     var fallback_fixer: String
     var max_fix_rounds: Int
+    var review_model: String?
     var reasoning_effort: String
     var poll_interval_seconds: Int
     var concurrency: Int
@@ -1888,9 +1889,16 @@ struct SettingsSheetView: View {
     @State private var allowText = ""
     @State private var appIDText = ""
     @State private var appKeyPathText = ""
+    @State private var reviewModelText = ""
     @State private var liveCommentOn = true
     @State private var saving = false
 
+    private let modelPresets: [(label: String, value: String)] = [
+        ("默认", ""),
+        ("gpt-5.4", "gpt-5.4"),
+        ("gpt-5.3-codex", "gpt-5.3-codex"),
+        ("o3", "o3"),
+    ]
     private let efforts = ["low", "medium", "high", "max"]
     private let fixers = ["codex", "claude", "agy", "pi", "opencode"]
 
@@ -1922,9 +1930,14 @@ struct SettingsSheetView: View {
                                 .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundStyle(.secondary)
                             Toggle("新 PR / 新提交自动审查", isOn: c.auto_review)
-                            Toggle("PR 评论 @codex review 触发", isOn: c.comment_trigger)
+                            Toggle("PR 评论 @koklam-pr-bot / @codex review 触发", isOn: c.comment_trigger)
                             Toggle("审查不通过时自动派回原会话修复", isOn: c.auto_fix)
-                            Toggle("原会话不可恢复时允许新开会话", isOn: c.fallback_new_session)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Toggle("找不到原会话时自动新开会话修复", isOn: c.fallback_new_session)
+                                Text("关闭时不会擅自新开会话，会发通知并在「待拍板」等你选择")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                            }
                             Toggle("审查通过自动合并 PR", isOn: c.auto_merge)
                             Toggle("开审先发 Working 占位评论并原地更新", isOn: $liveCommentOn)
                             Toggle("跳过草稿 PR (Draft)", isOn: c.skip_draft)
@@ -1940,6 +1953,28 @@ struct SettingsSheetView: View {
                             Text("执行参数")
                                 .font(.system(size: 11.5, weight: .semibold))
                                 .foregroundStyle(.secondary)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Review 模型").font(.system(size: 12))
+                                    Spacer()
+                                    HStack(spacing: 4) {
+                                        ForEach(modelPresets, id: \.label) { preset in
+                                            let sel = reviewModelText.trimmingCharacters(in: .whitespacesAndNewlines) == preset.value
+                                            Button(preset.label) { reviewModelText = preset.value }
+                                                .buttonStyle(.plain)
+                                                .font(.system(size: 10.5, weight: sel ? .semibold : .regular))
+                                                .padding(.horizontal, 7)
+                                                .padding(.vertical, 4)
+                                                .background(sel ? Color.accentColor : Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                                                .foregroundStyle(sel ? .white : .primary)
+                                        }
+                                    }
+                                }
+                                TextField("留空使用 Codex CLI 默认模型，或手动输入模型名", text: $reviewModelText)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11.5, design: .monospaced))
+                            }
 
                             HStack {
                                 Text("推理深度").font(.system(size: 12))
@@ -1959,7 +1994,7 @@ struct SettingsSheetView: View {
                             }
 
                             HStack {
-                                Text("默认 Agent").font(.system(size: 12))
+                                Text("新开会话修复 Agent").font(.system(size: 12))
                                 Spacer()
                                 HStack(spacing: 4) {
                                     ForEach(fixers, id: \.self) { ag in
@@ -2095,6 +2130,7 @@ struct SettingsSheetView: View {
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
                     current.allowed_commenters = parsed
+                    current.review_model = reviewModelText.trimmingCharacters(in: .whitespacesAndNewlines)
                     current.live_status_comment = liveCommentOn
                     current.github_app_id = appIDText.trimmingCharacters(in: .whitespacesAndNewlines)
                     current.github_app_private_key = appKeyPathText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2117,6 +2153,7 @@ struct SettingsSheetView: View {
             let loaded = await store.fetchConfig()
             cfg = loaded
             allowText = (loaded?.allowed_commenters ?? []).joined(separator: ", ")
+            reviewModelText = loaded?.review_model ?? ""
             liveCommentOn = loaded?.live_status_comment ?? true
             appIDText = loaded?.github_app_id ?? ""
             appKeyPathText = loaded?.github_app_private_key ?? ""
