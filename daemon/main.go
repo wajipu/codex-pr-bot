@@ -2427,16 +2427,18 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	writeJSONAtomic(b.historyPath, b.history)
 
 	if ok {
+		if sha8 != "" {
+			b.state.SeenAuto[fmt.Sprintf("%s#%d:%s", repo, pr.Number, sha8)] = nowISO()
+		}
 		if parts := strings.SplitN(job.StateKey, "|", 2); len(parts) == 2 {
 			switch parts[0] {
 			case "auto":
 				b.state.SeenAuto[parts[1]] = nowISO()
-				writeJSONAtomic(b.statePath, b.state)
 			case "cmd":
 				b.state.SeenCmd[parts[1]] = nowISO()
-				writeJSONAtomic(b.statePath, b.state)
 			}
 		}
+		writeJSONAtomic(b.statePath, b.state)
 		if merged {
 			kept := b.openPRs[:0]
 			for _, p := range b.openPRs {
