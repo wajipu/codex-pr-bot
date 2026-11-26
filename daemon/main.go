@@ -1048,6 +1048,7 @@ func (b *Bot) buildReviewPrompt(repo string, pr GHPR, diffText, triggerInfo, age
 	sb.WriteString("1. **P0 / P1 缺陷**：逻辑错误、空指针/边界条件、并发/事务/状态机漏洞、数据丢失或越权风险。\n")
 	sb.WriteString("2. **回归与破坏性变更**：接口签名变更、配置/路由破坏、无意删除功能。\n")
 	sb.WriteString("3. **安全红线**：密钥/Token/内网地址/运行时产物误入库。\n")
+	sb.WriteString("4. **收敛原则**：只有真实会触发的功能缺陷、数据损坏、安全漏洞或编译/逻辑错误（P0/P1）才判「⚠️ 建议修改」或「❌ 高风险」；纯代码风格、防御性锦上添花或极低概率理论边界（P2/nit）只作为附注提示、不要阻塞合并，直接判「✅ 建议合并」，避免多轮无休止挑刺。\n")
 	sb.WriteString("4. **规范与附加指令**：若违反仓库 AGENTS.md，或触发评论带了额外重点要求，请明确指出。\n\n")
 	sb.WriteString("## 输出格式（严格遵守）\n")
 	sb.WriteString("第一行必须以以下四者之一开头，并附 1 句话总结：\n")
@@ -1760,6 +1761,8 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 	if err != nil {
 		return false, "git worktree add 失败: " + truncate(strings.TrimSpace(stderr), 160)
 	}
+	beforeOut, _, _ := runCmd(context.Background(), localRepo, "", "git", "rev-parse", "origin/"+head)
+	beforeSHA := strings.TrimSpace(beforeOut)
 
 	fixPrompt := fmt.Sprintf(
 		"你在仓库 `%s` 的 PR #%d（分支 `%s`）收到了 Codex CLI 代码审查意见，请直接修复以下问题：\n\n%s\n\n要求：\n"+
@@ -1792,9 +1795,9 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 		case "agy":
 			bin := findBin(cfg.AgyBin, "agy", []string{"~/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"})
 			if sid != "" {
-				return bin, []string{"--resume", sid, "--mode", "accept-edits", "-p", fixPrompt}, "", fmt.Sprintf("恢复 Antigravity 会话 (%s) 自动修复中...", shaPrefix(sid))
+				return bin, []string{"--conversation", sid, "--mode", "accept-edits", "--dangerously-skip-permissions", "-p", fixPrompt}, "", fmt.Sprintf("恢复 Antigravity 会话 (%s) 自动修复中...", shaPrefix(sid))
 			}
-			return bin, []string{"--mode", "accept-edits", "-p", fixPrompt}, "", "启动新 Antigravity 会话自动修复中..."
+			return bin, []string{"--mode", "accept-edits", "--dangerously-skip-permissions", "-p", fixPrompt}, "", "启动新 Antigravity 会话自动修复中..."
 		case "pi":
 			bin := findBin(cfg.PiBin, "pi", []string{"/opt/homebrew/bin/pi", "/usr/local/bin/pi", "~/.local/bin/pi"})
 			if sid != "" {
@@ -1906,6 +1909,18 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 			return false, fmt.Sprintf("修复 Agent 执行失败 (%v): %s", err, truncate(detail, 240))
 		}
 		return false, fmt.Sprintf("修复 Agent 执行失败: %v", err)
+	}
+
+	// Verify the fix agent actually pushed a new commit to origin/<head>
+	if beforeSHA != "" {
+		ctxChk, cancelChk := context.WithTimeout(context.Background(), 30*time.Second)
+		_, _, _ = runCmd(ctxChk, localRepo, "", "git", "fetch", "origin", head)
+		afterOut, _, _ := runCmd(ctxChk, localRepo, "", "git", "rev-parse", "origin/"+head)
+		cancelChk()
+		afterSHA := strings.TrimSpace(afterOut)
+		if afterSHA == "" || afterSHA == beforeSHA {
+			return false, fmt.Sprintf("%s 执行结束但未向分支 %s 推送任何新提交（HEAD 仍为 %s），已阻止假成功", useAgent, head, shaPrefix(beforeSHA))
+		}
 	}
 
 	mode := fmt.Sprintf("新 %s 会话", useAgent)
@@ -2239,6 +2254,8 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 			}
 			b.addDecision(repo, pr, "needs_decision", firstQ, reviewBody, sessPtr)
 			fixNote = "需人工拍板：已生成待确认卡片"
+		} else if verdict == "CHANGES_REQUESTED" && strings.Contains(job.TriggerInfo, "MCP") {
+			fixNote = "已通过 MCP 返回评审意见给原会话自行修复（跳过外部抢跑修复）"
 		} else if verdict == "CHANGES_REQUESTED" && boolDefault(cfg.AutoFix, true) {
 			if sid == "" && !boolDefault(cfg.FallbackNewSession, false) {
 				fixNote = "未绑定可恢复的 CLI 会话（已按配置不新开会话，请拍板或复制修复指令）"
