@@ -2249,8 +2249,14 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		finishStep("done", fmt.Sprintf("%d 字符", len(diffText)))
 
 		maxDiff := intDefault(cfg.MaxDiffChars, 60000)
+		diffText = strings.ToValidUTF8(diffText, "")
 		if len(diffText) > maxDiff {
-			diffText = diffText[:maxDiff] + fmt.Sprintf("\n... [diff truncated at %d chars]", maxDiff)
+			// Cut cleanly on a UTF-8 rune boundary so Rust CLIs (codex) never see invalid UTF-8 on stdin
+			cut := maxDiff
+			for cut > 0 && (diffText[cut]&0xC0) == 0x80 {
+				cut--
+			}
+			diffText = strings.ToValidUTF8(diffText[:cut], "") + fmt.Sprintf("\n... [diff truncated at %d bytes]", cut)
 		}
 
 		workDir, agentsMD := b.readLocalAgentsMD(cfg, repo)
