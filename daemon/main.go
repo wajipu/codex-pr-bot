@@ -1967,6 +1967,72 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 	return true, fmt.Sprintf("已由 %s 修复并推送新提交，等待自动重审", mode)
 }
 
+func waitForPRChecks(gh, repo string, number int, setStage func(string)) (bool, string) {
+	deadline := time.Now().Add(6 * time.Minute)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		out, _, err := runCmd(ctx, "", "", gh, "pr", "view", strconv.Itoa(number), "--repo", repo, "--json", "statusCheckRollup")
+		cancel()
+		if err != nil {
+			return false, "查询 GitHub CI 状态失败，已暂缓自动合并"
+		}
+		var parsed struct {
+			StatusCheckRollup []struct {
+				Name       string `json:"name"`
+				Context    string `json:"context"`
+				Status     string `json:"status"`     // COMPLETED | IN_PROGRESS | QUEUED | PENDING
+				State      string `json:"state"`      // SUCCESS | FAILURE | PENDING | ERROR (StatusContext)
+				Conclusion string `json:"conclusion"` // SUCCESS | FAILURE | NEUTRAL | SKIPPED | CANCELLED | TIMED_OUT
+			} `json:"statusCheckRollup"`
+		}
+		if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+			return false, "解析 GitHub CI 状态失败，已暂缓自动合并"
+		}
+		if len(parsed.StatusCheckRollup) == 0 {
+			return true, "无 CI 检查项"
+		}
+		var pending []string
+		var failed []string
+		for _, c := range parsed.StatusCheckRollup {
+			name := c.Name
+			if name == "" {
+				name = c.Context
+			}
+			if name == "" {
+				name = "check"
+			}
+			st := strings.ToUpper(strings.TrimSpace(c.Status))
+			concl := strings.ToUpper(strings.TrimSpace(c.Conclusion))
+			state := strings.ToUpper(strings.TrimSpace(c.State))
+
+			if st != "" {
+				if st != "COMPLETED" {
+					pending = append(pending, name)
+				} else if concl != "SUCCESS" && concl != "SKIPPED" && concl != "NEUTRAL" {
+					failed = append(failed, fmt.Sprintf("%s(%s)", name, concl))
+				}
+			} else if state != "" {
+				if state == "PENDING" || state == "EXPECTED" {
+					pending = append(pending, name)
+				} else if state != "SUCCESS" {
+					failed = append(failed, fmt.Sprintf("%s(%s)", name, state))
+				}
+			}
+		}
+		if len(failed) > 0 {
+			return false, "CI 未通过：" + strings.Join(failed, ", ") + "，已阻止自动合并"
+		}
+		if len(pending) == 0 {
+			return true, fmt.Sprintf("全部 %d 项 CI 已通过", len(parsed.StatusCheckRollup))
+		}
+		if time.Now().After(deadline) {
+			return false, "等待 CI 超时（仍在运行：" + strings.Join(pending, ", ") + "），已暂缓自动合并"
+		}
+		setStage("评审已通过，等待 GitHub CI 通过：" + strings.Join(pending, ", ") + "...")
+		time.Sleep(15 * time.Second)
+	}
+}
+
 func (b *Bot) executeReview(workerID int, job reviewJob) {
 	cfg := b.reloadConfig()
 	gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
@@ -2263,26 +2329,35 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 
 		prAll := pr.Body + "\n" + pr.Title
 		if verdict == "PASS" && boolDefault(cfg.AutoMerge, true) && !pr.IsDraft && !noMergeRe.MatchString(prAll) {
-			useMerge := noSquashRe.MatchString(prAll)
-			flag := "--squash"
-			label := "squash"
-			if useMerge {
-				flag = "--merge"
-				label = "merge"
-			}
-			startStep("自动合并", fmt.Sprintf("审查通过，自动合并（%s）...", label))
-			ctxM, cancelM := context.WithTimeout(context.Background(), 60*time.Second)
-			_, stderr, err = runCmd(ctxM, "", "", gh, "pr", "merge", strconv.Itoa(pr.Number), "--repo", repo, flag, "--delete-branch")
-			cancelM()
-			if err == nil {
-				merged = true
-				mergeNote = fmt.Sprintf("已自动合并（%s）", label)
-				finishStep("done", mergeNote)
-				b.log(fmt.Sprintf("[Worker #%d] 🎉 %s#%d %s", workerID, short, pr.Number, mergeNote))
+			startStep("CI 门禁", "核验 GitHub Actions CI 状态...")
+			ciOK, ciMsg := waitForPRChecks(gh, repo, pr.Number, setStage)
+			if !ciOK {
+				mergeNote = ciMsg
+				finishStep("failed", ciMsg)
+				b.log(fmt.Sprintf("[Worker #%d] 🛑 %s#%d %s", workerID, short, pr.Number, ciMsg))
 			} else {
-				mergeNote = "自动合并失败: " + truncate(strings.TrimSpace(stderr), 140)
-				finishStep("failed", mergeNote)
-				b.log(fmt.Sprintf("[Worker #%d] ⚠️ %s#%d %s", workerID, short, pr.Number, mergeNote))
+				finishStep("done", ciMsg)
+				useMerge := noSquashRe.MatchString(prAll)
+				flag := "--squash"
+				label := "squash"
+				if useMerge {
+					flag = "--merge"
+					label = "merge"
+				}
+				startStep("自动合并", fmt.Sprintf("审查与 CI 均通过，自动合并（%s）...", label))
+				ctxM, cancelM := context.WithTimeout(context.Background(), 60*time.Second)
+				_, stderr, err = runCmd(ctxM, "", "", gh, "pr", "merge", strconv.Itoa(pr.Number), "--repo", repo, flag, "--delete-branch")
+				cancelM()
+				if err == nil {
+					merged = true
+					mergeNote = fmt.Sprintf("已自动合并（%s）", label)
+					finishStep("done", mergeNote)
+					b.log(fmt.Sprintf("[Worker #%d] 🎉 %s#%d %s", workerID, short, pr.Number, mergeNote))
+				} else {
+					mergeNote = "自动合并失败: " + truncate(strings.TrimSpace(stderr), 140)
+					finishStep("failed", mergeNote)
+					b.log(fmt.Sprintf("[Worker #%d] ⚠️ %s#%d %s", workerID, short, pr.Number, mergeNote))
+				}
 			}
 		} else if verdict == "NEEDS_DECISION" {
 			firstQ := reviewBody
