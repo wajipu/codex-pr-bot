@@ -386,6 +386,7 @@ type State struct {
 	SeenAuto          map[string]string         `json:"seen_auto"`
 	SeenCmd           map[string]string         `json:"seen_cmd"`
 	FixRounds         map[string]int            `json:"fix_rounds"`
+	PendingMerges     map[string]string         `json:"pending_merges"`
 	SessionBindings   map[string]SessionBinding `json:"session_bindings"`
 	TotalUsage        TokenUsage                `json:"total_usage"`
 	DailyUsage        map[string]TokenUsage     `json:"daily_usage"`
@@ -1343,6 +1344,58 @@ func (b *Bot) scanOnce() int {
 				}
 			}
 
+			// Retry auto-merge for PRs that already PASSED review and were waiting on slow CI
+			prKey := fmt.Sprintf("%s#%d", repo, pr.Number)
+			short := shortRepoName(repo)
+			b.mu.Lock()
+			pendingMergeSha := b.state.PendingMerges[prKey]
+			b.mu.Unlock()
+			if pendingMergeSha != "" && boolDefault(cfg.AutoMerge, true) {
+				if pendingMergeSha != sha8 {
+					b.mu.Lock()
+					delete(b.state.PendingMerges, prKey)
+					writeJSONAtomic(b.statePath, b.state)
+					b.mu.Unlock()
+				} else if !pr.IsDraft && !noMergeRe.MatchString(pr.Body+"\n"+pr.Title) {
+					ciSt, ciDetail := checkPRChecksOnce(gh, repo, pr.Number)
+					if ciSt == "pass" {
+						flag := "--squash"
+						label := "squash"
+						if noSquashRe.MatchString(pr.Body + "\n" + pr.Title) {
+							flag = "--merge"
+							label = "merge"
+						}
+						ctxM, cancelM := context.WithTimeout(context.Background(), 60*time.Second)
+						_, stderr, errM := runCmd(ctxM, "", "", gh, "pr", "merge", strconv.Itoa(pr.Number), "--repo", repo, flag, "--delete-branch")
+						cancelM()
+						b.mu.Lock()
+						delete(b.state.PendingMerges, prKey)
+						writeJSONAtomic(b.statePath, b.state)
+						b.mu.Unlock()
+						if errM == nil {
+							b.log(fmt.Sprintf("🎉 CI 已变绿，自动补合并 %s#%d（%s）", short, pr.Number, label))
+							b.appendEvent(TimelineEvent{
+								Kind:    "done",
+								Actor:   "自动补合并",
+								Pill:    fmt.Sprintf("%s#%d", short, pr.Number),
+								Summary: fmt.Sprintf("%s#%d CI 已通过，自动补合并成功（%s）", short, pr.Number, label),
+								Repo:    repo,
+								Number:  pr.Number,
+								URL:     pr.URL,
+							})
+						} else {
+							b.log(fmt.Sprintf("⚠️ CI 已变绿但补合并 %s#%d 失败: %s", short, pr.Number, truncate(strings.TrimSpace(stderr), 140)))
+						}
+					} else if ciSt == "fail" {
+						b.mu.Lock()
+						delete(b.state.PendingMerges, prKey)
+						writeJSONAtomic(b.statePath, b.state)
+						b.mu.Unlock()
+						b.log(fmt.Sprintf("🛑 %s#%d %s，已取消自动补合并", short, pr.Number, ciDetail))
+					}
+				}
+			}
+
 			if boolDefault(cfg.CommentTrigger, true) {
 				var latestCmd *GHComment
 				for i := range pr.Comments {
@@ -1967,69 +2020,81 @@ func (b *Bot) runAutoFix(cfg Config, repo string, pr GHPR, reviewBody, agentType
 	return true, fmt.Sprintf("已由 %s 修复并推送新提交，等待自动重审", mode)
 }
 
-func waitForPRChecks(gh, repo string, number int, setStage func(string)) (bool, string) {
+func checkPRChecksOnce(gh, repo string, number int) (status string, detail string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	out, _, err := runCmd(ctx, "", "", gh, "pr", "view", strconv.Itoa(number), "--repo", repo, "--json", "statusCheckRollup")
+	cancel()
+	if err != nil {
+		return "error", "查询 GitHub CI 状态失败，已暂缓自动合并"
+	}
+	var parsed struct {
+		StatusCheckRollup []struct {
+			Name       string `json:"name"`
+			Context    string `json:"context"`
+			Status     string `json:"status"`
+			State      string `json:"state"`
+			Conclusion string `json:"conclusion"`
+		} `json:"statusCheckRollup"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		return "error", "解析 GitHub CI 状态失败，已暂缓自动合并"
+	}
+	if len(parsed.StatusCheckRollup) == 0 {
+		return "pass", "无 CI 检查项"
+	}
+	var pending []string
+	var failed []string
+	for _, c := range parsed.StatusCheckRollup {
+		name := c.Name
+		if name == "" {
+			name = c.Context
+		}
+		if name == "" {
+			name = "check"
+		}
+		st := strings.ToUpper(strings.TrimSpace(c.Status))
+		concl := strings.ToUpper(strings.TrimSpace(c.Conclusion))
+		state := strings.ToUpper(strings.TrimSpace(c.State))
+
+		if st != "" {
+			if st != "COMPLETED" {
+				pending = append(pending, name)
+			} else if concl != "SUCCESS" && concl != "SKIPPED" && concl != "NEUTRAL" {
+				failed = append(failed, fmt.Sprintf("%s(%s)", name, concl))
+			}
+		} else if state != "" {
+			if state == "PENDING" || state == "EXPECTED" {
+				pending = append(pending, name)
+			} else if state != "SUCCESS" {
+				failed = append(failed, fmt.Sprintf("%s(%s)", name, state))
+			}
+		}
+	}
+	if len(failed) > 0 {
+		return "fail", "CI 未通过：" + strings.Join(failed, ", ") + "，已阻止自动合并"
+	}
+	if len(pending) > 0 {
+		return "pending", strings.Join(pending, ", ")
+	}
+	return "pass", fmt.Sprintf("全部 %d 项 CI 已通过", len(parsed.StatusCheckRollup))
+}
+
+func waitForPRChecks(gh, repo string, number int, setStage func(string)) (bool, bool, string) {
 	deadline := time.Now().Add(6 * time.Minute)
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		out, _, err := runCmd(ctx, "", "", gh, "pr", "view", strconv.Itoa(number), "--repo", repo, "--json", "statusCheckRollup")
-		cancel()
-		if err != nil {
-			return false, "查询 GitHub CI 状态失败，已暂缓自动合并"
-		}
-		var parsed struct {
-			StatusCheckRollup []struct {
-				Name       string `json:"name"`
-				Context    string `json:"context"`
-				Status     string `json:"status"`     // COMPLETED | IN_PROGRESS | QUEUED | PENDING
-				State      string `json:"state"`      // SUCCESS | FAILURE | PENDING | ERROR (StatusContext)
-				Conclusion string `json:"conclusion"` // SUCCESS | FAILURE | NEUTRAL | SKIPPED | CANCELLED | TIMED_OUT
-			} `json:"statusCheckRollup"`
-		}
-		if err := json.Unmarshal([]byte(out), &parsed); err != nil {
-			return false, "解析 GitHub CI 状态失败，已暂缓自动合并"
-		}
-		if len(parsed.StatusCheckRollup) == 0 {
-			return true, "无 CI 检查项"
-		}
-		var pending []string
-		var failed []string
-		for _, c := range parsed.StatusCheckRollup {
-			name := c.Name
-			if name == "" {
-				name = c.Context
+		st, detail := checkPRChecksOnce(gh, repo, number)
+		switch st {
+		case "pass":
+			return true, false, detail
+		case "fail", "error":
+			return false, false, detail
+		case "pending":
+			if time.Now().After(deadline) {
+				return false, true, "等待 CI 超时（仍在运行：" + detail + "），CI 变绿后将在下次轮询自动补合并"
 			}
-			if name == "" {
-				name = "check"
-			}
-			st := strings.ToUpper(strings.TrimSpace(c.Status))
-			concl := strings.ToUpper(strings.TrimSpace(c.Conclusion))
-			state := strings.ToUpper(strings.TrimSpace(c.State))
-
-			if st != "" {
-				if st != "COMPLETED" {
-					pending = append(pending, name)
-				} else if concl != "SUCCESS" && concl != "SKIPPED" && concl != "NEUTRAL" {
-					failed = append(failed, fmt.Sprintf("%s(%s)", name, concl))
-				}
-			} else if state != "" {
-				if state == "PENDING" || state == "EXPECTED" {
-					pending = append(pending, name)
-				} else if state != "SUCCESS" {
-					failed = append(failed, fmt.Sprintf("%s(%s)", name, state))
-				}
-			}
+			setStage("评审已通过，等待 GitHub CI 通过：" + detail + "...")
+			time.Sleep(15 * time.Second)
 		}
-		if len(failed) > 0 {
-			return false, "CI 未通过：" + strings.Join(failed, ", ") + "，已阻止自动合并"
-		}
-		if len(pending) == 0 {
-			return true, fmt.Sprintf("全部 %d 项 CI 已通过", len(parsed.StatusCheckRollup))
-		}
-		if time.Now().After(deadline) {
-			return false, "等待 CI 超时（仍在运行：" + strings.Join(pending, ", ") + "），已暂缓自动合并"
-		}
-		setStage("评审已通过，等待 GitHub CI 通过：" + strings.Join(pending, ", ") + "...")
-		time.Sleep(15 * time.Second)
 	}
 }
 
@@ -2330,10 +2395,19 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		prAll := pr.Body + "\n" + pr.Title
 		if verdict == "PASS" && boolDefault(cfg.AutoMerge, true) && !pr.IsDraft && !noMergeRe.MatchString(prAll) {
 			startStep("CI 门禁", "核验 GitHub Actions CI 状态...")
-			ciOK, ciMsg := waitForPRChecks(gh, repo, pr.Number, setStage)
+			ciOK, ciTimedOut, ciMsg := waitForPRChecks(gh, repo, pr.Number, setStage)
 			if !ciOK {
 				mergeNote = ciMsg
 				finishStep("failed", ciMsg)
+				if ciTimedOut && sha8 != "" {
+					b.mu.Lock()
+					if b.state.PendingMerges == nil {
+						b.state.PendingMerges = map[string]string{}
+					}
+					b.state.PendingMerges[prKey] = sha8
+					writeJSONAtomic(b.statePath, b.state)
+					b.mu.Unlock()
+				}
 				b.log(fmt.Sprintf("[Worker #%d] 🛑 %s#%d %s", workerID, short, pr.Number, ciMsg))
 			} else {
 				finishStep("done", ciMsg)
