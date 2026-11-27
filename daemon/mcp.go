@@ -329,6 +329,18 @@ func (c *mcpClient) handleToolCall(name string, rawArgs json.RawMessage) (string
 	}
 }
 
+func stripTestChecklistSection(body string) string {
+	lines := strings.Split(body, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if testHeadRe.MatchString(strings.TrimSpace(line)) {
+			break
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
 func formatHistoryForMCP(h HistoryItem) string {
 	var sb strings.Builder
 	verdict := h.Verdict
@@ -339,6 +351,7 @@ func formatHistoryForMCP(h HistoryItem) string {
 			verdict = "执行失败"
 		}
 	}
+	isPass := strings.EqualFold(verdict, "PASS") || h.Merged
 	sb.WriteString(fmt.Sprintf("## KoKLam PR Bot 评审结果：%s#%d\n", h.Repo, h.Number))
 	sb.WriteString(fmt.Sprintf("- **结论**：%s\n", verdict))
 	sb.WriteString(fmt.Sprintf("- **Commit**：`%s` · 耗时 `%ds`\n", h.Sha8, h.DurationSec))
@@ -346,17 +359,28 @@ func formatHistoryForMCP(h HistoryItem) string {
 	if h.Merged {
 		sb.WriteString("- **合并状态**：已自动合并\n")
 	}
-	if len(h.TestChecklist) > 0 {
-		sb.WriteString("\n### 🧪 待测试功能清单\n")
-		for _, t := range h.TestChecklist {
-			sb.WriteString("- " + t + "\n")
-		}
+
+	rawBody := strings.TrimSpace(h.Body)
+	if rawBody == "" {
+		rawBody = strings.TrimSpace(h.Summary)
 	}
-	sb.WriteString("\n### 详细评审意见\n")
-	if strings.TrimSpace(h.Body) != "" {
-		sb.WriteString(h.Body)
+	cleanBody := stripTestChecklistSection(rawBody)
+
+	if isPass {
+		if cleanBody != "" {
+			sb.WriteString("\n### 评审总结\n")
+			sb.WriteString(cleanBody + "\n")
+		}
+		if len(h.TestChecklist) > 0 {
+			sb.WriteString("\n### 🧪 待测试功能清单\n")
+			for _, t := range h.TestChecklist {
+				sb.WriteString("- " + t + "\n")
+			}
+		}
 	} else {
-		sb.WriteString(h.Summary)
+		// CHANGES_REQUESTED / ERROR: only return actionable issues, omit test checklist noise
+		sb.WriteString("\n### 需修复问题\n")
+		sb.WriteString(cleanBody)
 	}
 	return sb.String()
 }
