@@ -1401,7 +1401,7 @@ func (b *Bot) scanOnce() int {
 				var latestCmd *GHComment
 				for i := range pr.Comments {
 					c := &pr.Comments[i]
-					if strings.Contains(c.Body, botHeader) || strings.Contains(c.Body, "⏳ **Working...**") {
+					if strings.Contains(c.Body, botHeader) || strings.Contains(c.Body, "<!-- codex-cli-review-") || strings.Contains(c.Body, "⏳ **Working") {
 						continue
 					}
 					if strings.HasSuffix(strings.ToLower(c.Author.Login), "[bot]") {
@@ -2231,8 +2231,8 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 
 	func() {
 		if boolDefault(cfg.LiveStatusComment, true) {
-			initBody := fmt.Sprintf("%s (`%s`)\n\n⏳ **Working** · 正在拉取 PR Diff 并启动本机 Codex CLI 只读审查，完成后将原地更新本条评论...\n\n<sub>触发：%s</sub>\n%s\n",
-				botHeader, sha8, job.TriggerInfo, job.Marker)
+			initBody := fmt.Sprintf("⏳ **Working** · 正在拉取 PR Diff 并审查 `%s`，完成后将原地更新本条评论...\n\n<sub>触发：%s</sub>\n%s\n",
+				sha8, job.TriggerInfo, job.Marker)
 			if cid, err := b.postPRComment(cfg, gh, repo, pr.Number, initBody); err == nil && cid > 0 {
 				liveCommentID = cid
 			}
@@ -2381,8 +2381,8 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		})
 
 		startStep("回写评论", "回写 GitHub PR 评论...")
-		commentBody := fmt.Sprintf("%s (`%s`)\n\n%s\n\n<sub>触发：%s</sub>\n%s\n",
-			botHeader, sha8, reviewBody, job.TriggerInfo, job.Marker)
+		commentBody := fmt.Sprintf("%s\n\n<sub>`%s` · 触发：%s</sub>\n%s\n",
+			reviewBody, sha8, job.TriggerInfo, job.Marker)
 		var postErr error
 		if liveCommentID > 0 {
 			postErr = b.editPRComment(cfg, gh, repo, liveCommentID, commentBody)
@@ -2501,8 +2501,8 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 	if !ok {
 		b.log(fmt.Sprintf("[Worker #%d] ❌ 审查失败 %s#%d: %s", workerID, short, pr.Number, errorMsg))
 		if liveCommentID > 0 {
-			failBody := fmt.Sprintf("%s (`%s`)\n\n❌ **审查未能完成**：%s\n\n<sub>触发：%s</sub>\n",
-				botHeader, sha8, errorMsg, job.TriggerInfo)
+			failBody := fmt.Sprintf("❌ **审查未能完成**：%s\n\n<sub>`%s` · 触发：%s</sub>\n",
+				errorMsg, sha8, job.TriggerInfo)
 			_ = b.editPRComment(cfg, gh, repo, liveCommentID, failBody)
 		}
 	}
