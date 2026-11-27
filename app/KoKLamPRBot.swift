@@ -3333,7 +3333,7 @@ struct MainStreamWindowView: View {
                 .padding(14)
             }
         }
-        .frame(width: 560, height: 460)
+        .frame(width: isPopover ? 500 : 580, height: 460)
     }
 
     private var logsSheetView: some View {
@@ -3361,7 +3361,7 @@ struct MainStreamWindowView: View {
                 .padding(14)
             }
         }
-        .frame(width: 620, height: 460)
+        .frame(width: isPopover ? 500 : 620, height: 460)
     }
 
     private func formatDuration(_ sec: Int) -> String {
