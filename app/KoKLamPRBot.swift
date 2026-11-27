@@ -2147,7 +2147,7 @@ struct SettingsSheetView: View {
                             HStack {
                                 Text("并发上限（重启生效）").font(.system(size: 12))
                                 Spacer()
-                                Stepper("\(c.concurrency.wrappedValue) 个", value: c.concurrency, in: 1...5)
+                                Stepper("\(c.concurrency.wrappedValue) 个", value: c.concurrency, in: 1...8)
                                     .font(.system(size: 12, design: .monospaced))
                             }
 

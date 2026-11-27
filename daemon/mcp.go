@@ -134,13 +134,13 @@ func mcpToolDefinitions() []map[string]any {
 					},
 					"wait": map[string]any{
 						"type":        "boolean",
-						"description": "Whether to wait until the review completes and return the full review result (default: true)",
-						"default":     true,
+						"description": "Whether to block until review completes (default: false — async fire-and-return immediately; poll get_pr_review_status for result)",
+						"default":     false,
 					},
 					"timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Max seconds to wait when wait=true (default: 600)",
-						"default":     600,
+						"description": "Max seconds to wait when wait=true (default: 150, safely under 3-minute MCP client timeout)",
+						"default":     150,
 					},
 				},
 				"required": []string{"repo", "number"},
@@ -248,13 +248,16 @@ func (c *mcpClient) handleToolCall(name string, rawArgs json.RawMessage) (string
 			return "参数错误：需要 repo (owner/name) 和 number (PR 号)", true
 		}
 		repo := strings.TrimSpace(args.Repo)
-		wait := true
+		wait := false
 		if args.Wait != nil {
 			wait = *args.Wait
 		}
 		timeoutSec := args.TimeoutSeconds
 		if timeoutSec <= 0 {
-			timeoutSec = 600
+			timeoutSec = 150
+		}
+		if timeoutSec > 165 {
+			timeoutSec = 165
 		}
 
 		// Capture previous latest history ID for this PR so we know when the new review lands
@@ -282,7 +285,7 @@ func (c *mcpClient) handleToolCall(name string, rawArgs json.RawMessage) (string
 		}
 		if !wait {
 			msg, _ := res["message"].(string)
-			return fmt.Sprintf("已触发 %s#%d 评审（异步模式）：%s", repo, args.Number, msg), false
+			return fmt.Sprintf("🚀 已异步触发 %s#%d 评审（%s）。后台正在并行执行，稍后调用 get_pr_review_status(repo=%q, number=%d) 获取评审结论。", repo, args.Number, msg, repo, args.Number), false
 		}
 
 		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
@@ -301,7 +304,7 @@ func (c *mcpClient) handleToolCall(name string, rawArgs json.RawMessage) (string
 				}
 			}
 		}
-		return fmt.Sprintf("等待 %s#%d 评审结果超时（>%ds），评审可能仍在后台执行，可稍后调用 get_pr_review_status 查看。", repo, args.Number, timeoutSec), true
+		return fmt.Sprintf("⏳ %s#%d 评审仍在后台并行执行中（已等待 %ds，未丢任务）。请稍后调用 get_pr_review_status(repo=%q, number=%d) 获取完整结果。", repo, args.Number, timeoutSec, repo, args.Number), false
 
 	case "merge_pr":
 		var args struct {
