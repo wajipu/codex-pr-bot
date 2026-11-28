@@ -1017,6 +1017,130 @@ func (b *Bot) getLocalRepoDir(cfg Config, repo string) string {
 	return ""
 }
 
+func isTempWorktreePath(wtPath, repoDir string) bool {
+	p := filepath.Clean(wtPath)
+	r := filepath.Clean(repoDir)
+	if p == "" || p == r {
+		return false
+	}
+	if strings.HasPrefix(p, filepath.Join(r, ".worktrees")+string(filepath.Separator)) ||
+		strings.HasPrefix(p, filepath.Join(r, ".worktree")+string(filepath.Separator)) {
+		return true
+	}
+	for _, marker := range []string{
+		"/.worktrees/",
+		"/.worktree/",
+		"/.claude/worktrees/",
+		"/.codex/worktrees/",
+		"/.koklam-pr-bot/worktrees/",
+		"/.gemini/antigravity/brain/",
+	} {
+		if strings.Contains(p, marker) {
+			return true
+		}
+	}
+	if strings.HasPrefix(p, "/tmp/") || strings.HasPrefix(p, "/private/tmp/") {
+		return true
+	}
+	return false
+}
+
+// cleanupMergedWorktrees removes clean temporary git worktrees checked out on a just-merged PR branch.
+func (b *Bot) cleanupMergedWorktrees(cfg Config, repo, branch string) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" || branch == "main" || branch == "master" || branch == "develop" {
+		return
+	}
+	repoDir := b.getLocalRepoDir(cfg, repo)
+	if repoDir == "" {
+		return
+	}
+	gitBin := findBin("", "git", []string{"/opt/homebrew/bin/git", "/usr/bin/git"})
+	short := shortRepoName(repo)
+
+	ctxP, cancelP := context.WithTimeout(context.Background(), 20*time.Second)
+	_, _, _ = runCmd(ctxP, repoDir, "", gitBin, "worktree", "prune")
+	cancelP()
+
+	ctxL, cancelL := context.WithTimeout(context.Background(), 20*time.Second)
+	out, _, err := runCmd(ctxL, repoDir, "", gitBin, "worktree", "list", "--porcelain")
+	cancelL()
+	if err != nil {
+		return
+	}
+
+	type wtEntry struct {
+		path   string
+		branch string
+	}
+	var entries []wtEntry
+	var cur wtEntry
+	flush := func() {
+		if cur.path != "" {
+			entries = append(entries, cur)
+			cur = wtEntry{}
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(line, "worktree ") {
+			cur.path = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		} else if strings.HasPrefix(line, "branch ") {
+			cur.branch = strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(line, "branch ")), "refs/heads/")
+		}
+	}
+	flush()
+
+	removed := 0
+	for i, e := range entries {
+		if i == 0 || e.branch != branch || !isTempWorktreePath(e.path, repoDir) {
+			continue
+		}
+		if _, stErr := os.Stat(e.path); stErr != nil {
+			continue
+		}
+		ctxS, cancelS := context.WithTimeout(context.Background(), 15*time.Second)
+		stOut, _, stErr := runCmd(ctxS, e.path, "", gitBin, "status", "--porcelain")
+		cancelS()
+		if stErr != nil || strings.TrimSpace(stOut) != "" {
+			b.log(fmt.Sprintf("⚠️ [%s] 跳过清理有未提交改动的临时 worktree: %s (%s)", short, e.path, branch))
+			continue
+		}
+		ctxR, cancelR := context.WithTimeout(context.Background(), 30*time.Second)
+		_, rmErrOut, rmErr := runCmd(ctxR, repoDir, "", gitBin, "worktree", "remove", e.path)
+		cancelR()
+		if rmErr != nil {
+			ctxRF, cancelRF := context.WithTimeout(context.Background(), 30*time.Second)
+			_, rmErrOut, rmErr = runCmd(ctxRF, repoDir, "", gitBin, "worktree", "remove", "--force", e.path)
+			cancelRF()
+		}
+		if rmErr != nil {
+			b.log(fmt.Sprintf("⚠️ [%s] 清理临时 worktree 失败 %s: %s", short, e.path, truncate(strings.TrimSpace(rmErrOut), 120)))
+			continue
+		}
+		removed++
+		b.log(fmt.Sprintf("🧹 [%s] 已自动清理已合并分支 %s 的临时 worktree: %s", short, branch, e.path))
+	}
+
+	if removed > 0 {
+		ctxP2, cancelP2 := context.WithTimeout(context.Background(), 20*time.Second)
+		_, _, _ = runCmd(ctxP2, repoDir, "", gitBin, "worktree", "prune")
+		cancelP2()
+		// Remove empty .worktrees directory if nothing remains inside
+		wtRoot := filepath.Join(repoDir, ".worktrees")
+		if entries, err := os.ReadDir(wtRoot); err == nil && len(entries) == 0 {
+			_ = os.Remove(wtRoot)
+		}
+		ctxB, cancelB := context.WithTimeout(context.Background(), 15*time.Second)
+		_, _, _ = runCmd(ctxB, repoDir, "", gitBin, "branch", "-d", branch)
+		cancelB()
+	}
+}
+
 func (b *Bot) readLocalAgentsMD(cfg Config, repo string) (string, string) {
 	dir := b.getLocalRepoDir(cfg, repo)
 	if dir != "" {
@@ -1421,6 +1545,7 @@ func (b *Bot) scanOnce() int {
 						b.mu.Unlock()
 						if errM == nil {
 							b.log(fmt.Sprintf("🎉 CI 已变绿，自动补合并 %s#%d（%s）", short, pr.Number, label))
+							go b.cleanupMergedWorktrees(cfg, repo, pr.HeadRefName)
 							b.appendEvent(TimelineEvent{
 								Kind:    "done",
 								Actor:   "自动补合并",
@@ -2178,6 +2303,7 @@ func (b *Bot) watchAndMergePR(repo string, pr GHPR, sha8 string) {
 			b.mu.Unlock()
 			if errM == nil {
 				b.log(fmt.Sprintf("🎉 CI 已变绿，后台自动合并 %s#%d（%s）", short, pr.Number, label))
+				go b.cleanupMergedWorktrees(cfg, repo, pr.HeadRefName)
 				b.appendEvent(TimelineEvent{
 					Kind:    "done",
 					Actor:   "自动合并",
@@ -2544,6 +2670,7 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 					mergeNote = fmt.Sprintf("已自动合并（%s）", label)
 					finishStep("done", mergeNote)
 					b.log(fmt.Sprintf("[Worker #%d] 🎉 %s#%d %s", workerID, short, pr.Number, mergeNote))
+					go b.cleanupMergedWorktrees(cfg, repo, pr.HeadRefName)
 				} else {
 					mergeNote = "自动合并失败: " + truncate(strings.TrimSpace(stderr), 140)
 					finishStep("failed", mergeNote)
@@ -3255,8 +3382,12 @@ func main() {
 		cfg := bot.reloadConfig()
 		gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
 		ctxV, cancelV := context.WithTimeout(context.Background(), 30*time.Second)
-		stdout, _, _ := runCmd(ctxV, "", "", gh, "pr", "view", strconv.Itoa(req.Number), "--repo", repo, "--json", "title,body")
+		stdout, _, _ := runCmd(ctxV, "", "", gh, "pr", "view", strconv.Itoa(req.Number), "--repo", repo, "--json", "title,body,headRefName")
 		cancelV()
+		var prMeta struct {
+			HeadRefName string `json:"headRefName"`
+		}
+		_ = json.Unmarshal([]byte(stdout), &prMeta)
 		flag := "--squash"
 		label := "squash"
 		if noSquashRe.MatchString(stdout) {
@@ -3272,6 +3403,7 @@ func main() {
 			writeJSON(w, 500, map[string]any{"ok": false, "message": msg})
 			return
 		}
+		go bot.cleanupMergedWorktrees(cfg, repo, prMeta.HeadRefName)
 		bot.mu.Lock()
 		kept := bot.openPRs[:0]
 		for _, p := range bot.openPRs {
