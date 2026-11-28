@@ -2099,6 +2099,63 @@ func waitForPRChecks(gh, repo string, number int, setStage func(string)) (bool, 
 	}
 }
 
+func (b *Bot) watchAndMergePR(repo string, pr GHPR, sha8 string) {
+	prKey := fmt.Sprintf("%s#%d", repo, pr.Number)
+	short := shortRepoName(repo)
+	cfg := b.reloadConfig()
+	gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
+
+	deadline := time.Now().Add(15 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Second)
+		b.mu.Lock()
+		pendingSha := b.state.PendingMerges[prKey]
+		b.mu.Unlock()
+		if pendingSha != sha8 {
+			return
+		}
+		st, detail := checkPRChecksOnce(gh, repo, pr.Number)
+		switch st {
+		case "pass":
+			flag := "--squash"
+			label := "squash"
+			if noSquashRe.MatchString(pr.Body + "\n" + pr.Title) {
+				flag = "--merge"
+				label = "merge"
+			}
+			ctxM, cancelM := context.WithTimeout(context.Background(), 60*time.Second)
+			_, stderr, errM := runCmd(ctxM, "", "", gh, "pr", "merge", strconv.Itoa(pr.Number), "--repo", repo, flag, "--delete-branch")
+			cancelM()
+			b.mu.Lock()
+			delete(b.state.PendingMerges, prKey)
+			writeJSONAtomic(b.statePath, b.state)
+			b.mu.Unlock()
+			if errM == nil {
+				b.log(fmt.Sprintf("🎉 CI 已变绿，后台自动合并 %s#%d（%s）", short, pr.Number, label))
+				b.appendEvent(TimelineEvent{
+					Kind:    "done",
+					Actor:   "自动合并",
+					Pill:    fmt.Sprintf("%s#%d", short, pr.Number),
+					Summary: fmt.Sprintf("%s#%d CI 已通过，自动合并成功（%s）", short, pr.Number, label),
+					Repo:    repo,
+					Number:  pr.Number,
+					URL:     pr.URL,
+				})
+			} else {
+				b.log(fmt.Sprintf("⚠️ CI 已变绿但自动合并 %s#%d 失败: %s", short, pr.Number, truncate(strings.TrimSpace(stderr), 140)))
+			}
+			return
+		case "fail":
+			b.mu.Lock()
+			delete(b.state.PendingMerges, prKey)
+			writeJSONAtomic(b.statePath, b.state)
+			b.mu.Unlock()
+			b.log(fmt.Sprintf("🛑 %s#%d %s，已取消自动合并", short, pr.Number, detail))
+			return
+		}
+	}
+}
+
 func (b *Bot) executeReview(workerID int, job reviewJob) {
 	cfg := b.reloadConfig()
 	gh := findBin(cfg.GhBin, "gh", []string{"/opt/homebrew/bin/gh", "/usr/local/bin/gh"})
@@ -2402,11 +2459,12 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 		prAll := pr.Body + "\n" + pr.Title
 		if verdict == "PASS" && boolDefault(cfg.AutoMerge, true) && !pr.IsDraft && !noMergeRe.MatchString(prAll) {
 			startStep("CI 门禁", "核验 GitHub Actions CI 状态...")
-			ciOK, ciTimedOut, ciMsg := waitForPRChecks(gh, repo, pr.Number, setStage)
-			if !ciOK {
-				mergeNote = ciMsg
-				finishStep("failed", ciMsg)
-				if ciTimedOut && sha8 != "" {
+			ciSt, ciDetail := checkPRChecksOnce(gh, repo, pr.Number)
+			if ciSt == "pending" {
+				// Non-blocking: hand off CI wait + merge to a dedicated goroutine and free this Worker immediately!
+				mergeNote = "评审已通过，已转入后台并行等待 CI 变绿后自动合并（" + ciDetail + "）"
+				finishStep("done", mergeNote)
+				if sha8 != "" {
 					b.mu.Lock()
 					if b.state.PendingMerges == nil {
 						b.state.PendingMerges = map[string]string{}
@@ -2414,10 +2472,15 @@ func (b *Bot) executeReview(workerID int, job reviewJob) {
 					b.state.PendingMerges[prKey] = sha8
 					writeJSONAtomic(b.statePath, b.state)
 					b.mu.Unlock()
+					go b.watchAndMergePR(repo, pr, sha8)
 				}
-				b.log(fmt.Sprintf("[Worker #%d] 🛑 %s#%d %s", workerID, short, pr.Number, ciMsg))
+				b.log(fmt.Sprintf("[Worker #%d] ⏳ %s#%d %s", workerID, short, pr.Number, mergeNote))
+			} else if ciSt != "pass" {
+				mergeNote = ciDetail
+				finishStep("failed", ciDetail)
+				b.log(fmt.Sprintf("[Worker #%d] 🛑 %s#%d %s", workerID, short, pr.Number, ciDetail))
 			} else {
-				finishStep("done", ciMsg)
+				finishStep("done", ciDetail)
 				useMerge := noSquashRe.MatchString(prAll)
 				flag := "--squash"
 				label := "squash"
