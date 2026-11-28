@@ -283,6 +283,15 @@ func (c *mcpClient) handleToolCall(name string, rawArgs json.RawMessage) (string
 		if err != nil {
 			return fmt.Sprintf("触发评审失败：%v", err), true
 		}
+		if reused, _ := res["reused"].(bool); reused {
+			if snap, err := c.getStatus(); err == nil {
+				for _, h := range snap.History {
+					if strings.EqualFold(h.Repo, repo) && h.Number == args.Number {
+						return formatHistoryForMCP(h), !h.OK
+					}
+				}
+			}
+		}
 		if !wait {
 			msg, _ := res["message"].(string)
 			return fmt.Sprintf("🚀 已异步触发 %s#%d 评审（%s）。后台正在并行执行，稍后调用 get_pr_review_status(repo=%q, number=%d) 获取评审结论。", repo, args.Number, msg, repo, args.Number), false

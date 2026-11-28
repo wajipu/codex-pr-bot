@@ -1218,8 +1218,10 @@ func (b *Bot) buildReviewPrompt(repo string, pr GHPR, diffText, triggerInfo, age
 	sb.WriteString("1. **全量通读、一次报全（禁止挤牙膏）**：在输出结论前，必须完整通读 Diff 中所有变更文件；若存在多个阻断问题（如 A、B、C），**必须在本轮一次性全部列出**，严禁只先报 1–2 个打回、把其余已存在的问题留到下一轮。\n")
 	sb.WriteString("2. **只抓真实 P0 / P1**：逻辑错误、空指针/边界崩溃、并发/事务/状态机漏洞、数据损坏、越权、破坏性回归、密钥/内网地址入库，或明显违反 AGENTS.md 红线。\n")
 	sb.WriteString("3. **收敛原则**：只有真实会触发的 P0/P1 才判 `⚠️` 或 `❌`；风格、防御性优化、极低概率理论边界（P2/nit）不要阻塞合并，直接判 `✅`。若问题已超出当前 PR 代码/仓库能力范围（如平台边界、需管理员配置或跨服务改造），不要反复用 `❌`/`⚠️` 打回，改判 `🤔 需人工拍板` 并给出选项。\n")
-	if prevCount > 0 {
-		sb.WriteString("4. **复审收敛规则（重点）**：当前为复审轮次，请优先核对「历史审查记录」中上一轮指出的问题是否已修干净，并检查本次修复是否引入新的真实 P0/P1 回归；若均已解决，**必须直接判 `✅`**，禁止在未改动的老代码上反复扩圈挑新毛病（打地鼠），除非发现了之前遗漏的必现崩溃、数据损坏或严重越权级 P0。\n\n")
+	if prevCount >= 2 {
+		sb.WriteString(fmt.Sprintf("4. **第 %d 轮硬收敛规则（强制执行）**：本 PR 已历经多轮修改，请优先核对上一轮指出的问题是否已修完；**本轮仅允许因 P0 级硬伤打回**（必现崩溃、编译/测试失败、数据损坏、严重越权/密钥泄露、或明确违反 AGENTS.md 红线）。**严禁再因极窄并发时序、极低概率边界或理论竞态（如“重建瞬间恰好锁屏”“续页恰好跨午夜”等）继续打回**——若主问题已修完且无 P0 硬伤，**必须直接判 `✅` 放行**。\n\n", prevCount+1))
+	} else if prevCount == 1 {
+		sb.WriteString("4. **复审收敛规则（重点）**：当前为第 2 轮复审，请优先核对「历史审查记录」中上一轮指出的问题是否已修干净，并检查本次修复是否引入新的真实 P0/P1 回归；若均已解决，**必须直接判 `✅`**，禁止在未改动的老代码上反复扩圈挑新毛病（打地鼠），除非发现了之前遗漏的必现崩溃、数据损坏或严重越权级 P0。\n\n")
 	} else {
 		sb.WriteString("\n")
 	}
@@ -1663,7 +1665,7 @@ func (b *Bot) scanOnce() int {
 	return added
 }
 
-func (b *Bot) triggerManualPR(repo string, number int, note, sessionSpec string) (bool, string) {
+func (b *Bot) triggerManualPR(repo string, number int, note, sessionSpec string, force ...bool) (bool, string, bool) {
 	if strings.Contains(sessionSpec, ":") {
 		parts := strings.SplitN(sessionSpec, ":", 2)
 		ag := strings.ToLower(strings.TrimSpace(parts[0]))
@@ -1683,17 +1685,38 @@ func (b *Bot) triggerManualPR(repo string, number int, note, sessionSpec string)
 	stdout, stderr, err := runCmd(ctx, "", "", gh, "pr", "view", strconv.Itoa(number), "--repo", repo,
 		"--json", "number,title,url,body,headRefName,headRefOid,baseRefName,isDraft,comments")
 	if err != nil {
-		return false, "gh pr view 失败: " + truncate(strings.TrimSpace(stderr), 160)
+		return false, "gh pr view 失败: " + truncate(strings.TrimSpace(stderr), 160), false
 	}
 	var pr GHPR
 	if err := json.Unmarshal([]byte(stdout), &pr); err != nil {
-		return false, "解析 PR 失败"
+		return false, "解析 PR 失败", false
 	}
 	sha8 := shaPrefix(pr.HeadRefOid)
+	trimmedNote := strings.TrimSpace(note)
+	isForce := len(force) > 0 && force[0]
+	isDefaultNote := trimmedNote == "" || trimmedNote == "MCP 闭环评审触发"
+	if !isForce && isDefaultNote && sha8 != "" {
+		b.mu.Lock()
+		var cached *HistoryItem
+		for i := range b.history {
+			h := b.history[i]
+			if strings.EqualFold(h.Repo, repo) && h.Number == number && strings.EqualFold(h.Sha8, sha8) && h.OK && strings.TrimSpace(h.Body) != "" {
+				cp := h
+				cached = &cp
+				break
+			}
+		}
+		b.mu.Unlock()
+		if cached != nil {
+			b.log(fmt.Sprintf("♻️ 复用已有审查结论：%s#%d (%s) -> %s", shortRepoName(repo), number, sha8, cached.Verdict))
+			return true, fmt.Sprintf("该提交 (%s) 已审查完成，直接复用结论：%s", sha8, cached.Verdict), true
+		}
+	}
+
 	tsID := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	trigger := "桌面端手动触发"
-	if strings.TrimSpace(note) != "" {
-		trigger += "：" + strings.TrimSpace(note)
+	if trimmedNote != "" {
+		trigger += "：" + trimmedNote
 	}
 	b.enqueueJob(reviewJob{
 		Repo:        repo,
@@ -1703,7 +1726,7 @@ func (b *Bot) triggerManualPR(repo string, number int, note, sessionSpec string)
 		TriggerInfo: trigger,
 	})
 	b.log(fmt.Sprintf("手动加入队列：%s#%d (%s)", shortRepoName(repo), number, sha8))
-	return true, "已加入审查队列"
+	return true, "已加入审查队列", false
 }
 
 func (b *Bot) triggerManualFix(repo string, number int, reviewBody, agent, sessionID, note string) (bool, string) {
@@ -3326,18 +3349,19 @@ func main() {
 			Number       int    `json:"number"`
 			Note         string `json:"note"`
 			AgentSession string `json:"agent_session"`
+			Force        bool   `json:"force"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Repo == "" || req.Number <= 0 {
 			writeJSON(w, 400, map[string]any{"ok": false, "message": "缺少 repo 或 number"})
 			return
 		}
-		ok, msg := bot.triggerManualPR(strings.TrimSpace(req.Repo), req.Number, req.Note, req.AgentSession)
+		ok, msg, reused := bot.triggerManualPR(strings.TrimSpace(req.Repo), req.Number, req.Note, req.AgentSession, req.Force)
 		code := 200
 		if !ok {
 			code = 500
 		}
-		writeJSON(w, code, map[string]any{"ok": ok, "message": msg})
+		writeJSON(w, code, map[string]any{"ok": ok, "message": msg, "reused": reused})
 	})
 	mux.HandleFunc("/api/fix", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
